@@ -59,7 +59,7 @@ public class MySqlRecordHandlerTest
     private MySqlRecordHandler mySqlRecordHandler;
     private Connection connection;
     private JdbcConnectionFactory jdbcConnectionFactory;
-    private JdbcSplitQueryBuilder jdbcSplitQueryBuilder;
+    private MySqlQueryStringBuilder jdbcSplitQueryBuilder;
     private S3Client amazonS3;
     private SecretsManagerClient secretsManager;
     private AthenaClient athena;
