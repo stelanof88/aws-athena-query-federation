@@ -20,7 +20,6 @@
 package com.amazonaws.athena.connectors.jdbc.manager;
 
 import com.amazonaws.athena.connector.credentials.CredentialsProvider;
-import com.amazonaws.athena.connector.credentials.DefaultCredentialsProvider;
 import com.amazonaws.athena.connector.lambda.QueryStatusChecker;
 import com.amazonaws.athena.connector.lambda.data.BlockAllocator;
 import com.amazonaws.athena.connector.lambda.data.BlockWriter;
@@ -190,12 +189,6 @@ public abstract class JdbcMetadataHandler
     }
 
     @Override
-    public CredentialsProvider createCredentialsProvider(String secretName, AwsRequestOverrideConfiguration requestOverrideConfiguration)
-    {
-        return new DefaultCredentialsProvider(getSecret(secretName, requestOverrideConfiguration));
-    }
-
-    @Override
     public ListSchemasResponse doListSchemaNames(final BlockAllocator blockAllocator, final ListSchemasRequest listSchemasRequest)
             throws Exception
     {
@@ -323,9 +316,7 @@ public abstract class JdbcMetadataHandler
 
             return new GetTableResponse(getTableRequest.getCatalogName(),
                     adjustedTableNameObject,
-                    Objects.nonNull(requestOverrideConfig)
-                            ? getSchema(connection, adjustedTableNameObject, partitionSchema, requestOverrideConfig)
-                            : getSchema(connection, adjustedTableNameObject, partitionSchema),
+                    getSchema(connection, adjustedTableNameObject, partitionSchema, requestOverrideConfig),
                     partitionSchema.getFields().stream().map(Field::getName).collect(Collectors.toSet()));
         }
     }
@@ -407,24 +398,7 @@ public abstract class JdbcMetadataHandler
     }
 
     /**
-     * Gets the schema for a table. This method delegates to the 4-parameter version with null for requestOverrideConfiguration.
-     * Subclasses should override the 4-parameter version instead of this method.
-     *
-     * @param jdbcConnection the JDBC connection
-     * @param tableName the table name
-     * @param partitionSchema the partition schema
-     * @return the schema
-     * @throws Exception if an error occurs
-     */
-    protected final Schema getSchema(Connection jdbcConnection, TableName tableName, Schema partitionSchema)
-            throws Exception
-    {
-        return getSchema(jdbcConnection, tableName, partitionSchema, null);
-    }
-
-    /**
      * Gets the schema for a table with optional request override configuration.
-     * This is the main implementation method that subclasses should override if they need to customize schema retrieval.
      *
      * @param jdbcConnection the JDBC connection
      * @param tableName the table name

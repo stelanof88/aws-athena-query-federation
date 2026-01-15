@@ -26,8 +26,9 @@ import com.amazonaws.athena.connector.lambda.domain.predicate.Range;
 import com.amazonaws.athena.connector.lambda.domain.predicate.SortedRangeSet;
 import com.amazonaws.athena.connector.lambda.domain.predicate.ValueSet;
 import com.amazonaws.athena.connector.lambda.exceptions.AthenaConnectorException;
+import com.amazonaws.athena.connector.substrait.SubstraitAccumulatorVisitor;
 import com.amazonaws.athena.connector.substrait.SubstraitSqlUtils;
-import com.amazonaws.athena.connectors.jdbc.visitor.SubstraitAccumulatorVisitor;
+import com.amazonaws.athena.connector.substrait.SubstraitTypeAndValue;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
@@ -421,16 +422,7 @@ public abstract class JdbcSplitQueryBuilder
 
             PreparedStatement statement = jdbcConnection.prepareStatement(root.toSqlString(sqlDialect).getSql());
 
-            int parameterCount = statement.getParameterMetaData().getParameterCount();
-
-            if (parameterCount != accumulator.size()) {
-                LOGGER.error("Parameter count mismatch: SQL has {} parameters, accumulator has {}. Skipping parameter binding.",
-                        parameterCount, accumulator.size());
-            }
-            else {
-                handleDataTypesForPreparedStatement(statement, accumulator, tableSchema);
-            }
-
+            handleDataTypesForPreparedStatement(statement, accumulator, tableSchema);
             LOGGER.debug("CalciteSql prepared statement: {}", statement);
 
             return statement;
