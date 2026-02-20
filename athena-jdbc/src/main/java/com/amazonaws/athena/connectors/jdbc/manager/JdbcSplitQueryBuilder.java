@@ -436,7 +436,10 @@ public abstract class JdbcSplitQueryBuilder
 
             LOGGER.debug("CalciteSql parameterized sql with dialect {}: {}", sqlDialect.toString(), parameterizedNode.toSqlString(sqlDialect).getSql());
             LOGGER.debug("CalciteSql parameters: {}", accumulator.toString());
-
+            
+            System.out.println(parameterizedNode.toSqlString(sqlDialect).getSql());
+            System.out.println(accumulator.size());
+            
             PreparedStatement statement = jdbcConnection.prepareStatement(parameterizedNode.toSqlString(sqlDialect).getSql());
             ParameterMetaData metaData = statement.getParameterMetaData();
             if (metaData != null && metaData.getParameterCount() != accumulator.size()) {
