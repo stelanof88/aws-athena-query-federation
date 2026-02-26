@@ -26,14 +26,23 @@ import io.substrait.proto.Plan;
 import io.substrait.proto.ReadRel;
 import io.substrait.proto.Rel;
 import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.rel.core.Aggregate;
+import org.apache.calcite.rel.core.Project;
 import org.apache.calcite.rel.rel2sql.RelToSqlConverter;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
+import org.apache.calcite.rel.type.RelDataTypeField;
+import org.apache.calcite.rex.RexInputRef;
+import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.sql.SqlDialect;
 import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.type.SqlTypeFactoryImpl;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 
 /**
  * Utility class for converting Substrait plans to SQL and extracting schema information.
@@ -85,6 +94,17 @@ public final class SubstraitSqlUtils
             throw new RuntimeException("Failed to extract table schema from Substrait plan", e);
         }
     }
+    
+    public static Map<String, String> getColumnRemapping(final String planString, final SqlDialect sqlDialect)
+    {
+        final Plan protoPlan = SubstraitRelUtils.deserializeSubstraitPlan(planString);
+        final Map<String, String> columnRemapping = new LinkedHashMap<>();
+        final RelNode relNode = getRelNodeFromSubstraitPlan(protoPlan, sqlDialect);
+        RelDataTypeFactory.Builder builder = relNode.getCluster().getTypeFactory().builder();
+        traverse(relNode, builder, columnRemapping);
+        LOGGER.debug("Column rename mapping (original → renamed): {}", columnRemapping);
+        return columnRemapping;
+    }
 
     private static RelDataType getTableSchemaFromSubstraitPlan(final Plan protoPlan, final SqlDialect sqlDialect)
     {
@@ -97,7 +117,7 @@ public final class SubstraitSqlUtils
         
         final RelNode relNode = getRelNodeFromSubstraitPlan(protoPlan, sqlDialect);
         RelDataTypeFactory.Builder builder = relNode.getCluster().getTypeFactory().builder();
-        traverse(relNode, builder);
+        traverse(relNode, builder, new LinkedHashMap<>());
         
         return builder.build();
     }
@@ -121,12 +141,90 @@ public final class SubstraitSqlUtils
         }
     }
     
-    private static void traverse(RelNode node, RelDataTypeFactory.Builder builder)
+    /**
+     * Traverses the RelNode tree, adding fields to the builder only for TableScan (leaf)
+     * or Project/Aggregate (select with renaming) nodes, and builds a column rename mapping.
+     * <p>
+     * The rename mapping tracks how output column names map back to the original
+     * base table column names. For example:
+     * <ul>
+     *   <li>{@code varchar_col0 → varchar_col} (direct column reference renamed by Calcite)</li>
+     *   <li>{@code $f24 → null} (computed expression, no direct column mapping)</li>
+     * </ul>
+     *
+     * @param node The current RelNode being traversed
+     * @param builder The builder collecting the schema fields
+     * @param renameMapping Output map: renamed column name → original base table column name (null for computed expressions)
+     */
+    private static void traverse(RelNode node, RelDataTypeFactory.Builder builder, Map<String, String> renameMapping)
     {
-        RelDataType schema = node.getRowType();
-        builder.addAll(schema.getFieldList());
+        if (node.getInputs().isEmpty()) {
+            // Case 1: TableScan (leaf node) - add base table fields
+            builder.addAll(node.getRowType().getFieldList());
+        }
+        else if (node instanceof Project) {
+            // Case 2: Project (SELECT with renaming) - add renamed fields and build rename mapping
+            Project project = (Project) node;
+            List<RelDataTypeField> inputFields = project.getInput().getRowType().getFieldList();
+            List<RelDataTypeField> outputFields = project.getRowType().getFieldList();
+
+            // Add the renamed column names and their types to the builder
+            builder.addAll(outputFields);
+
+            for (int i = 0; i < project.getProjects().size(); i++) {
+                RexNode rex = project.getProjects().get(i);
+                String outputName = outputFields.get(i).getName();
+                if (rex instanceof RexInputRef) {
+                    int inputIndex = ((RexInputRef) rex).getIndex();
+                    String originalName = inputFields.get(inputIndex).getName();
+                    if (!outputName.equals(originalName)) {
+                        renameMapping.put(outputName, originalName);
+                    }
+                }
+                else {
+                    renameMapping.put(outputName, null);
+                }
+            }
+        }
+        else if (node instanceof Aggregate) {
+            // Case 2b: Aggregate (GROUP BY with renaming) - add renamed fields and build rename mapping
+            Aggregate aggregate = (Aggregate) node;
+            List<RelDataTypeField> inputFields = aggregate.getInput().getRowType().getFieldList();
+            List<RelDataTypeField> outputFields = aggregate.getRowType().getFieldList();
+
+            // Add the renamed column names and their types to the builder
+            builder.addAll(outputFields);
+
+            int outputIdx = 0;
+            // Group key columns map back to input columns via groupSet indices
+            for (int groupIndex : aggregate.getGroupSet()) {
+                String outputName = outputFields.get(outputIdx).getName();
+                String originalName = inputFields.get(groupIndex).getName();
+                if (!outputName.equals(originalName)) {
+                    renameMapping.put(outputName, originalName);
+                }
+                outputIdx++;
+            }
+            
+            // Aggregate function columns (SUM, COUNT, AVG, etc.) are computed expressions with no base column mapping
+            while (outputIdx < outputFields.size()) {
+                String outputName = outputFields.get(outputIdx).getName();
+                renameMapping.put(outputName, null);
+                outputIdx++;
+            }
+        }
+
+        // Recurse into child nodes
         for (RelNode input : node.getInputs()) {
-            traverse(input, builder);
+            traverse(input, builder, renameMapping);
+        }
+
+        // Resolve transitive renames: if output maps to intermediate, and intermediate maps further, follow the chain
+        for (Map.Entry<String, String> entry : renameMapping.entrySet()) {
+            String intermediate = entry.getValue();
+            if (intermediate != null && renameMapping.containsKey(intermediate)) {
+                entry.setValue(renameMapping.get(intermediate));
+            }
         }
     }
 }

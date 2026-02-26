@@ -26,8 +26,6 @@ import com.amazonaws.athena.connector.substrait.SubstraitTypeAndValue;
 import com.amazonaws.athena.connector.util.EncodedSubstraitPlanStringGenerator;
 import org.apache.calcite.sql.SqlDialect;
 import org.apache.calcite.sql.dialect.AnsiSqlDialect;
-import org.apache.calcite.sql.dialect.OracleSqlDialect;
-import org.apache.calcite.sql.dialect.SnowflakeSqlDialect;
 import org.apache.calcite.sql.type.SqlTypeName;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -288,130 +286,132 @@ public class JdbcSplitQueryBuilderIntegrationTest {
         return Stream.of(
                 // Basic Data Retrieval
                 Arguments.of("Basic Data Retrieval", "Simple select",
-                        "SELECT * FROM test_table LIMIT 10"),
+                        "SELECT * FROM test_table LIMIT 10", 3),
                 Arguments.of("Basic Data Retrieval", "Specific columns",
-                        "SELECT int_col, varchar_col, bigint_col, decimal_col FROM test_table LIMIT 100"),
+                        "SELECT int_col, varchar_col, bigint_col, decimal_col FROM test_table LIMIT 100", 3),
                 Arguments.of("Basic Data Retrieval", "Count records",
-                        "SELECT COUNT(*) FROM test_table"),
+                        "SELECT COUNT(*) FROM test_table", 1),
                 Arguments.of("Basic Data Retrieval", "Distinct values",
-                        "SELECT DISTINCT bool_col FROM test_table"),
+                        "SELECT DISTINCT bool_col FROM test_table", 2),
                 Arguments.of("Basic Data Retrieval", "Distinct years",
-                        "SELECT DISTINCT EXTRACT(YEAR FROM date_col) as \"year\" FROM test_table"),
+                        "SELECT DISTINCT EXTRACT(YEAR FROM date_col) as \"year\" FROM test_table", 3),
 
                 // Filtering & Conditions
                 Arguments.of("Filtering & Conditions", "Numeric filter",
-                        "SELECT * FROM test_table WHERE int_col > 1000"),
+                        "SELECT * FROM test_table WHERE int_col > 1000", 2),
                 Arguments.of("Filtering & Conditions", "Range filter",
-                        "SELECT * FROM test_table WHERE int_col BETWEEN 100 AND 500"),
+                        "SELECT * FROM test_table WHERE int_col BETWEEN 100 AND 500", 0),
                 Arguments.of("Filtering & Conditions", "String exact match",
-                        "SELECT * FROM test_table WHERE varchar_col = 'varchar_value'"),
+                        "SELECT * FROM test_table WHERE varchar_col = 'varchar_value'", 1),
                 Arguments.of("Filtering & Conditions", "String pattern LIKE",
-                        "SELECT * FROM test_table WHERE varchar_col LIKE '%varchar%'"),
+                        "SELECT * FROM test_table WHERE varchar_col LIKE '%varchar%'", 2),
                 Arguments.of("Filtering & Conditions", "IN clause",
-                        "SELECT * FROM test_table WHERE varchar_col IN ('varchar_value', 'another_varchar', 'third_value')"),
+                        "SELECT * FROM test_table WHERE varchar_col IN ('varchar_value', 'another_varchar', 'third_value')", 3),
                 Arguments.of("Filtering & Conditions", "Year filter",
-                        "SELECT * FROM test_table WHERE EXTRACT(YEAR FROM date_col) = 2020"),
+                        "SELECT * FROM test_table WHERE EXTRACT(YEAR FROM date_col) = 2020", 1),
                 Arguments.of("Filtering & Conditions", "Year range",
-                        "SELECT * FROM test_table WHERE EXTRACT(YEAR FROM date_col) >= 2020"),
+                        "SELECT * FROM test_table WHERE EXTRACT(YEAR FROM date_col) >= 2020", 2),
                 // Arguments.of("Filtering & Conditions", "Null check",
-                //         "SELECT * FROM test_table WHERE float_col IS NULL"),
+                //         "SELECT * FROM test_table WHERE float_col IS NULL", 0),
                 Arguments.of("Filtering & Conditions", "Not null check",
-                        "SELECT * FROM test_table WHERE decimal_col IS NOT NULL"),
+                        "SELECT * FROM test_table WHERE decimal_col IS NOT NULL", 3),
                 Arguments.of("Filtering & Conditions", "Boolean filters",
-                        "SELECT * FROM test_table WHERE bool_col = true ORDER BY timestamp_col"),
+                        "SELECT * FROM test_table WHERE bool_col = true ORDER BY timestamp_col", 2),
 
                 // Data Type Conversions
                 Arguments.of("Data Type Conversions", "Price conversion",
-                        "SELECT int_col, CAST(decimal_col AS DOUBLE) as price_num FROM test_table"),
+                        "SELECT int_col, CAST(decimal_col AS DOUBLE) as price_num FROM test_table", 3),
                 Arguments.of("Data Type Conversions", "Year conversion",
-                        "SELECT int_col, CAST(EXTRACT(YEAR FROM date_col) AS INTEGER) as year_int FROM test_table"),
+                        "SELECT int_col, CAST(EXTRACT(YEAR FROM date_col) AS INTEGER) as year_int FROM test_table", 3),
 
                 // Aggregations
                 Arguments.of("Aggregations", "Basic stats",
-                        "SELECT COUNT(*), AVG(CAST(decimal_col AS DOUBLE)) FROM test_table"),
+                        "SELECT COUNT(*), AVG(CAST(decimal_col AS DOUBLE)) FROM test_table", 1),
                 Arguments.of("Aggregations", "Min/Max year",
-                        "SELECT MAX(EXTRACT(YEAR FROM date_col)), MIN(EXTRACT(YEAR FROM date_col)) FROM test_table"),
+                        "SELECT MAX(EXTRACT(YEAR FROM date_col)), MIN(EXTRACT(YEAR FROM date_col)) FROM test_table", 1),
                 Arguments.of("Aggregations", "Sum price",
-                        "SELECT SUM(CAST(decimal_col AS DOUBLE)) FROM test_table"),
+                        "SELECT SUM(CAST(decimal_col AS DOUBLE)) FROM test_table", 1),
                 Arguments.of("Aggregations", "Group by status",
-                        "SELECT bool_col, COUNT(*) FROM test_table GROUP BY bool_col"),
+                        "SELECT bool_col, COUNT(*) FROM test_table GROUP BY bool_col", 2),
                 Arguments.of("Aggregations", "Group by year",
-                        "SELECT EXTRACT(YEAR FROM date_col) as \"year\", COUNT(*) FROM test_table GROUP BY EXTRACT(YEAR FROM date_col) ORDER BY \"year\""),
+                        "SELECT EXTRACT(YEAR FROM date_col) as \"year\", COUNT(*) FROM test_table GROUP BY EXTRACT(YEAR FROM date_col) ORDER BY \"year\"", 3),
                 Arguments.of("Aggregations", "Avg price by model",
-                        "SELECT varchar_col, AVG(CAST(decimal_col AS DOUBLE)) FROM test_table GROUP BY varchar_col"),
+                        "SELECT varchar_col, AVG(CAST(decimal_col AS DOUBLE)) FROM test_table GROUP BY varchar_col", 3),
 
                 // Complex Filtering
                 Arguments.of("Complex Filtering", "Multiple conditions",
-                        "SELECT * FROM test_table WHERE EXTRACT(YEAR FROM date_col) >= 2020 AND bool_col = true AND CAST(decimal_col AS DOUBLE) < 80000"),
+                        "SELECT * FROM test_table WHERE EXTRACT(YEAR FROM date_col) >= 2020 AND bool_col = true AND CAST(decimal_col AS DOUBLE) < 80000", 1),
                 Arguments.of("Complex Filtering", "Pattern matching",
-                        "SELECT * FROM test_table WHERE varchar_col LIKE 'varchar%'"),
+                        "SELECT * FROM test_table WHERE varchar_col LIKE 'varchar%'", 1),
                 Arguments.of("Complex Filtering", "Case statement",
-                        "SELECT int_col, varchar_col, CASE WHEN EXTRACT(YEAR FROM date_col) >= 2020 THEN CAST('Recent' AS VARCHAR) ELSE CAST('Old' AS VARCHAR) END as age_category FROM test_table"),
+                        "SELECT int_col, varchar_col, CASE WHEN EXTRACT(YEAR FROM date_col) >= 2020 THEN CAST('Recent' AS VARCHAR) ELSE CAST('Old' AS VARCHAR) END as age_category FROM test_table", 3),
 
                 // Sorting & Limiting
                 Arguments.of("Sorting & Limiting", "Order by ID desc",
-                        "SELECT * FROM test_table ORDER BY int_col DESC LIMIT 50"),
+                        "SELECT * FROM test_table ORDER BY int_col DESC LIMIT 50", 3),
                 Arguments.of("Sorting & Limiting", "Order by price asc",
-                        "SELECT * FROM test_table ORDER BY CAST(decimal_col AS DOUBLE) ASC LIMIT 20"),
+                        "SELECT * FROM test_table ORDER BY CAST(decimal_col AS DOUBLE) ASC LIMIT 20", 3),
                 Arguments.of("Sorting & Limiting", "Multiple sort",
-                        "SELECT * FROM test_table ORDER BY EXTRACT(YEAR FROM date_col) DESC, varchar_col ASC LIMIT 100"),
+                        "SELECT * FROM test_table ORDER BY EXTRACT(YEAR FROM date_col) DESC, varchar_col ASC LIMIT 100", 3),
 
                 // String Functions
                 Arguments.of("String Functions", "Case conversion",
-                        "SELECT UPPER(varchar_col), LOWER(varchar_col) FROM test_table LIMIT 10"),
+                        "SELECT UPPER(varchar_col), LOWER(varchar_col) FROM test_table LIMIT 10", 3),
 
                 // Date/Time Functions
                 Arguments.of("Date/Time Functions", "Age calculation",
-                        "SELECT *, (2024 - EXTRACT(YEAR FROM date_col)) as age FROM test_table LIMIT 10"),
+                        "SELECT *, (2024 - EXTRACT(YEAR FROM date_col)) as age FROM test_table LIMIT 10", 3),
 
                 // Window Functions
                 Arguments.of("Window Functions", "Row numbering",
-                        "SELECT *, ROW_NUMBER() OVER (ORDER BY int_col) as row_num FROM test_table LIMIT 10"),
+                        "SELECT *, ROW_NUMBER() OVER (ORDER BY int_col) as row_num FROM test_table LIMIT 10", 3),
                 Arguments.of("Window Functions", "Price ranking",
-                        "SELECT *, RANK() OVER (ORDER BY CAST(decimal_col AS DOUBLE) DESC) as price_rank FROM test_table LIMIT 20"),
+                        "SELECT *, RANK() OVER (ORDER BY CAST(decimal_col AS DOUBLE) DESC) as price_rank FROM test_table LIMIT 20", 3),
                 Arguments.of("Window Functions", "Partition window",
-                        "SELECT *, COUNT(*) OVER (PARTITION BY bool_col) as status_count FROM test_table"),
+                        "SELECT *, COUNT(*) OVER (PARTITION BY bool_col) as status_count FROM test_table", 3),
 
                 // Performance Testing
                 Arguments.of("Performance Testing", "Large result set",
-                        "SELECT * FROM test_table LIMIT 10000"),
+                        "SELECT * FROM test_table LIMIT 10000", 3),
                 Arguments.of("Performance Testing", "Complex aggregation",
-                        "SELECT varchar_col, bool_col, COUNT(*), AVG(CAST(decimal_col AS DOUBLE)), MIN(CAST(int_col AS INTEGER)), MAX(EXTRACT(YEAR FROM date_col)) FROM test_table GROUP BY varchar_col, bool_col ORDER BY COUNT(*) DESC"),
+                        "SELECT varchar_col, bool_col, COUNT(*), AVG(CAST(decimal_col AS DOUBLE)), MIN(CAST(int_col AS INTEGER)), MAX(EXTRACT(YEAR FROM date_col)) FROM test_table GROUP BY varchar_col, bool_col ORDER BY COUNT(*) DESC", 3),
 
                 // Data Quality Checks
                 Arguments.of("Data Quality Checks", "Duplicate check",
-                        "SELECT int_col, COUNT(*) FROM test_table GROUP BY int_col HAVING COUNT(*) > 1"),
+                        "SELECT int_col, COUNT(*) FROM test_table GROUP BY int_col HAVING COUNT(*) > 1", 0),
                 Arguments.of("Data Quality Checks", "Completeness check",
-                        "SELECT COUNT(*) as total_rows, COUNT(int_col) as int_count, COUNT(varchar_col) as varchar_count, COUNT(decimal_col) as price_count FROM test_table"),
+                        "SELECT COUNT(*) as total_rows, COUNT(int_col) as int_count, COUNT(varchar_col) as varchar_count, COUNT(decimal_col) as price_count FROM test_table", 1),
                 Arguments.of("Data Quality Checks", "Value ranges",
-                        "SELECT MIN(EXTRACT(YEAR FROM date_col)) as min_year, MAX(EXTRACT(YEAR FROM date_col)) as max_year, MIN(CAST(decimal_col AS DOUBLE)) as min_price, MAX(CAST(decimal_col AS DOUBLE)) as max_price FROM test_table"),
+                        "SELECT MIN(EXTRACT(YEAR FROM date_col)) as min_year, MAX(EXTRACT(YEAR FROM date_col)) as max_year, MIN(CAST(decimal_col AS DOUBLE)) as min_price, MAX(CAST(decimal_col AS DOUBLE)) as max_price FROM test_table", 1),
 
                 // Boolean Column Tests - Testing standalone boolean and NOT boolean transformations
+                Arguments.of("Boolean Column Tests", "boolean column with values",
+                        "SELECT * FROM test_table WHERE bool_col = true LIMIT 10", 2),
                 Arguments.of("Boolean Column Tests", "Standalone boolean column",
-                        "SELECT * FROM test_table WHERE bool_col LIMIT 10"),
+                        "SELECT * FROM test_table WHERE bool_col LIMIT 10", 2),
                 Arguments.of("Boolean Column Tests", "Standalone boolean column with NOT",
-                        "SELECT * FROM test_table WHERE NOT bool_col LIMIT 10"),
+                        "SELECT * FROM test_table WHERE NOT bool_col LIMIT 10", 1),
                 Arguments.of("Boolean Column Tests", "Explicit boolean comparison true",
-                        "SELECT * FROM test_table WHERE bool_col = true LIMIT 10"),
+                        "SELECT * FROM test_table WHERE bool_col = true LIMIT 10", 2),
                 Arguments.of("Boolean Column Tests", "Explicit boolean comparison false",
-                        "SELECT * FROM test_table WHERE bool_col = false LIMIT 10"),
+                        "SELECT * FROM test_table WHERE bool_col = false LIMIT 10", 1),
                 Arguments.of("Boolean Column Tests", "Complex condition with NOT boolean",
-                        "SELECT * FROM test_table WHERE int_col > 1000 AND NOT bool_col LIMIT 10"),
+                        "SELECT * FROM test_table WHERE int_col > 1000 AND NOT bool_col LIMIT 10", 1),
                 Arguments.of("Boolean Column Tests", "Complex condition with boolean",
-                        "SELECT * FROM test_table WHERE int_col > 1000 AND bool_col LIMIT 10"),
+                        "SELECT * FROM test_table WHERE int_col > 1000 AND bool_col LIMIT 10", 1),
                 Arguments.of("Boolean Column Tests", "OR condition with boolean",
-                        "SELECT * FROM test_table WHERE bool_col OR int_col = 1500 LIMIT 10"),
+                        "SELECT * FROM test_table WHERE bool_col OR int_col = 1500 LIMIT 10", 2),
                 // Arguments.of("Boolean Column Tests", "Multiple boolean conditions",
-                //         "SELECT * FROM test_table WHERE bool_col AND NOT bool_col LIMIT 10"),
+                //         "SELECT * FROM test_table WHERE bool_col AND NOT bool_col LIMIT 10", 0),
                 Arguments.of("Boolean Column Tests", "Boolean in complex expression",
-                        "SELECT * FROM test_table WHERE (int_col > 1000 AND bool_col) OR (int_col < 500 AND NOT bool_col) LIMIT 10")
+                        "SELECT * FROM test_table WHERE (int_col > 1000 AND bool_col) OR (int_col < 500 AND NOT bool_col) LIMIT 10", 1)
         );
     }
 
     @ParameterizedTest(name = "[{index}] {0} - {1}")
     @MethodSource("provideCalciteSqlTestCases")
     public void testRealPreparedStatementWithCalciteSqlParameterized(String category,
-            String testCaseName, String sqlQuery) throws Exception {
+            String testCaseName, String sqlQuery, int expectedRowCount) throws Exception {
         // Generate base64 encoded Substrait plan from SQL query
         String base64EncodedPlan =
                 EncodedSubstraitPlanStringGenerator.generate(TEST_TABLE, TEST_SCHEMA, sqlQuery);
@@ -442,11 +442,13 @@ public class JdbcSplitQueryBuilderIntegrationTest {
         // Some queries may return no results (e.g., null checks, filters with no matches)
         // but the query should execute without errors
         int rowCount = 0;
-        while (rs.next() && rowCount < 100) { // Limit iteration for performance
+        while (rs.next()) {
             rowCount++;
         }
 
-        System.out.println(category + " - " + testCaseName + ": " + rowCount + " rows returned");
+        assertEquals(expectedRowCount, rowCount,
+                category + " - " + testCaseName + ": expected " + expectedRowCount
+                        + " rows but got " + rowCount);
 
         // Cleanup
         rs.close();

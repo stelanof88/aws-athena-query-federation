@@ -26,7 +26,6 @@ import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.schema.Schema;
 import org.apache.calcite.schema.Table;
 import org.apache.calcite.sql.SqlNode;
-import org.apache.calcite.sql.dialect.AnsiSqlDialect;
 import org.apache.calcite.sql.parser.SqlParseException;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
@@ -184,7 +183,7 @@ public class SubstraitSqlUtilsTest {
         String encodedPlan = Base64.getEncoder().encodeToString(planBytes);
         SqlNode sql = SubstraitSqlUtils.getSqlNodeFromSubstraitPlan(encodedPlan,
                 EncodedSubstraitPlanStringGenerator.DIALECT);
-        String sqlStr = sql.toSqlString(AnsiSqlDialect.DEFAULT).getSql();
+        String sqlStr = sql.toSqlString(EncodedSubstraitPlanStringGenerator.DIALECT).getSql();
 
         Assertions.assertNotNull(sqlStr);
     }
@@ -288,7 +287,9 @@ public class SubstraitSqlUtilsTest {
         SqlNode sql = SubstraitSqlUtils.getSqlNodeFromSubstraitPlan(encodedPlan,
                 EncodedSubstraitPlanStringGenerator.DIALECT);
         String sqlStr = sql.toSqlString(EncodedSubstraitPlanStringGenerator.DIALECT).getSql();
+        RelDataType tableSchema = SubstraitSqlUtils.getTableSchemaFromSubstraitPlan(encodedPlan, EncodedSubstraitPlanStringGenerator.DIALECT);
         Assertions.assertEquals(expectedSql, sqlStr);
+        Assertions.assertNotNull(tableSchema);
     }
 
     // HELPER METHODS

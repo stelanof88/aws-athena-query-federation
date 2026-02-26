@@ -51,6 +51,7 @@ import com.amazonaws.athena.connector.lambda.domain.predicate.Constraints;
 import com.amazonaws.athena.connector.lambda.exceptions.AthenaConnectorException;
 import com.amazonaws.athena.connector.lambda.handlers.RecordHandler;
 import com.amazonaws.athena.connector.lambda.records.ReadRecordsRequest;
+import com.amazonaws.athena.connector.substrait.SubstraitSqlUtils;
 import com.amazonaws.athena.connectors.jdbc.connection.DatabaseConnectionConfig;
 import com.amazonaws.athena.connectors.jdbc.connection.JdbcConnectionFactory;
 import com.amazonaws.athena.connectors.jdbc.qpt.JdbcQueryPassthrough;
@@ -69,6 +70,8 @@ import org.apache.arrow.vector.types.Types;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
+import org.apache.calcite.sql.SqlDialect;
+import org.apache.calcite.sql.dialect.AnsiSqlDialect;
 import org.apache.commons.lang3.Validate;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -171,6 +174,7 @@ public abstract class JdbcRecordHandler
                     readRecordsRequest.getSchema(), readRecordsRequest.getConstraints(), readRecordsRequest.getSplit());
                     ResultSet resultSet = preparedStatement.executeQuery()) {
                 Map<String, String> partitionValues = readRecordsRequest.getSplit().getProperties();
+                Map<String, String> colNameRemapping = getColumnNameRemapping(readRecordsRequest);
 
                 GeneratedRowWriter.RowWriterBuilder rowWriterBuilder = GeneratedRowWriter.newBuilder(readRecordsRequest.getConstraints());
                 for (Field next : readRecordsRequest.getSchema().getFields()) {
@@ -178,7 +182,7 @@ public abstract class JdbcRecordHandler
                         rowWriterBuilder.withFieldWriterFactory(next.getName(), makeFactory(next));
                     }
                     else {
-                        rowWriterBuilder.withExtractor(next.getName(), makeExtractor(next, resultSet, partitionValues));
+                        rowWriterBuilder.withExtractor(next.getName(), makeExtractor(next, resultSet, partitionValues, colNameRemapping));
                     }
                 }
 
@@ -232,41 +236,18 @@ public abstract class JdbcRecordHandler
     }
 
     /**
-     * Resolves the actual column name to use when accessing the ResultSet.
-     * 
-     * This method handles the difference between regular queries and Calcite-generated queries:
-     * - Regular queries: Columns use their original names (e.g., "EMPLOYEE_ID")
-     * - Calcite-generated queries: Columns use aliased names with "0" suffix (e.g., "EMPLOYEE_ID0")
-     * 
-     * The method first attempts to find the column with the aliased name (fieldName + "0"),
-     * and if that fails, falls back to the original field name. This ensures compatibility
-     * with both query generation approaches.
-     * 
-     * @param fieldName The original field/column name from the Arrow schema
-     * @param resultSet The ResultSet to check for column existence
-     * @return The actual column name that exists in the ResultSet
-     */
-    private String resolveColumnName(String fieldName, ResultSet resultSet)
-    {
-        try {
-            // Try with Calcite-style alias first (columnName + "0")
-            resultSet.findColumn(fieldName + "0");
-            return fieldName + "0";
-        }
-        catch (Exception e) {
-            // Column doesn't exist with alias, use original name
-            return fieldName;
-        }
-    }
-
-    /**
-     * Creates an Extractor for the given field. In this example the extractor just creates some random data.
+     * Creates an Extractor for the given field.
      */
     @VisibleForTesting
     protected Extractor makeExtractor(Field field, ResultSet resultSet, Map<String, String> partitionValues)
     {
+        return makeExtractor(field, resultSet, partitionValues, Map.of());
+    }
+    
+    private Extractor makeExtractor(Field field, ResultSet resultSet, Map<String, String> partitionValues, Map<String, String> colNameRemapping)
+    {
         Types.MinorType fieldType = Types.getMinorTypeForArrowType(field.getType());
-        final String fieldName = resolveColumnName(field.getName(), resultSet);
+        final String fieldName = colNameRemapping.getOrDefault(field.getName(), field.getName());
 
         if (partitionValues.containsKey(fieldName)) {
             return (VarCharExtractor) (Object context, NullableVarCharHolder dst) ->
@@ -392,5 +373,31 @@ public abstract class JdbcRecordHandler
         String clientPassQuery = constraints.getQueryPassthroughArguments().get(JdbcQueryPassthrough.QUERY);
         preparedStatement = jdbcConnection.prepareStatement(clientPassQuery);
         return preparedStatement;
+    }
+    
+    protected Map<String, String> getColumnNameRemapping(ReadRecordsRequest request)
+    {
+        if (request.getConstraints() != null 
+                && request.getConstraints().getQueryPlan() != null 
+                && request.getConstraints().getQueryPlan().getSubstraitPlan() != null) {
+            // Get renamed → original mapping from SubstraitSqlUtils
+            Map<String, String> renamedToOriginal = SubstraitSqlUtils.getColumnRemapping(
+                    request.getConstraints().getQueryPlan().getSubstraitPlan(), getSqlDialect());
+            
+            // Invert to original → renamed mapping (filtering out null values for computed expressions)
+            Map<String, String> originalToRenamed = new java.util.HashMap<>();
+            for (Map.Entry<String, String> entry : renamedToOriginal.entrySet()) {
+                if (entry.getValue() != null) {
+                    originalToRenamed.put(entry.getValue(), entry.getKey());
+                }
+            }
+            return originalToRenamed;
+        }
+        return Map.of();
+    }
+    
+    protected SqlDialect getSqlDialect() 
+    {
+        return AnsiSqlDialect.DEFAULT;
     }
 }

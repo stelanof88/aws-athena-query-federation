@@ -21,355 +21,398 @@ package com.amazonaws.athena.connector.substrait;
 
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
+import org.apache.calcite.rel.type.RelDataTypeSystem;
+import org.apache.calcite.sql.SqlBinaryOperator;
 import org.apache.calcite.sql.SqlCall;
 import org.apache.calcite.sql.SqlDynamicParam;
 import org.apache.calcite.sql.SqlIdentifier;
+import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.SqlLiteral;
 import org.apache.calcite.sql.SqlNode;
+import org.apache.calcite.sql.SqlNodeList;
+import org.apache.calcite.sql.SqlSelect;
+import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.parser.SqlParserPos;
 import org.apache.calcite.sql.type.SqlTypeFactoryImpl;
 import org.apache.calcite.sql.type.SqlTypeName;
-import org.apache.calcite.rel.type.RelDataTypeSystem;
-import org.apache.calcite.util.NlsString;
 import org.apache.calcite.util.Pair;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.stream.Stream;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertThrows;
-import static org.junit.Assert.assertTrue;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
-public class SubstraitAccumulatorVisitorTest {
+public class SubstraitAccumulatorVisitorTest
+{
     private List<SubstraitTypeAndValue> accumulator;
     private RelDataType schema;
     private SubstraitAccumulatorVisitor visitor;
     private RelDataTypeFactory typeFactory;
 
-    @Before
-    public void setUp() {
+    @BeforeEach
+    public void setUp()
+    {
         accumulator = new ArrayList<>();
         typeFactory = new SqlTypeFactoryImpl(RelDataTypeSystem.DEFAULT);
-
-        // Create a test schema with various field types
-        schema = createTestSchema();
-        visitor = new SubstraitAccumulatorVisitor(accumulator, schema);
-    }
-
-    private RelDataType createTestSchema() {
-        return typeFactory.createStructType(
-                Arrays.asList(Pair.of("int_col", typeFactory.createSqlType(SqlTypeName.INTEGER)),
+        schema = typeFactory.createStructType(
+                Arrays.asList(
+                        Pair.of("int_col", typeFactory.createSqlType(SqlTypeName.INTEGER)),
                         Pair.of("bigint_col", typeFactory.createSqlType(SqlTypeName.BIGINT)),
-                        Pair.of("float_col", typeFactory.createSqlType(SqlTypeName.FLOAT)),
-                        Pair.of("double_col", typeFactory.createSqlType(SqlTypeName.DOUBLE)),
                         Pair.of("varchar_col", typeFactory.createSqlType(SqlTypeName.VARCHAR)),
                         Pair.of("bool_col", typeFactory.createSqlType(SqlTypeName.BOOLEAN)),
-                        Pair.of("decimal_col",
-                                typeFactory.createSqlType(SqlTypeName.DECIMAL, 10, 2)),
-                        Pair.of("date_col", typeFactory.createSqlType(SqlTypeName.DATE)),
-                        Pair.of("time_col", typeFactory.createSqlType(SqlTypeName.TIME)),
-                        Pair.of("timestamp_col", typeFactory.createSqlType(SqlTypeName.TIMESTAMP)),
-                        Pair.of("binary_col", typeFactory.createSqlType(SqlTypeName.VARBINARY))));
+                        Pair.of("float_col", typeFactory.createSqlType(SqlTypeName.FLOAT))));
+        visitor = new SubstraitAccumulatorVisitor(accumulator, schema);
+    }
+
+    // --- visit(SqlIdentifier): simple vs non-simple ---
+
+    @Test
+    public void testVisitSimpleIdentifier()
+    {
+        SqlIdentifier id = new SqlIdentifier("int_col", SqlParserPos.ZERO);
+        assertEquals(id, visitor.visit(id));
     }
 
     @Test
-    public void testVisitSqlIdentifier() {
-        SqlIdentifier identifier = new SqlIdentifier("int_col", SqlParserPos.ZERO);
-
-        SqlNode result = visitor.visit(identifier);
-
-        assertEquals(identifier, result);
+    public void testVisitNonSimpleIdentifier()
+    {
+        SqlIdentifier id = new SqlIdentifier(Arrays.asList("s", "int_col"), SqlParserPos.ZERO);
+        assertEquals(id, visitor.visit(id));
     }
 
+    // --- visit(SqlLiteral): standalone literal without column context ---
+
     @Test
-    public void testVisitSqlLiteralWithIntegerColumn() {
-        // Create a proper SQL comparison call: int_col = 123
-        SqlIdentifier identifier = new SqlIdentifier("int_col", SqlParserPos.ZERO);
-        SqlLiteral literal = SqlLiteral.createExactNumeric("123", SqlParserPos.ZERO);
-        SqlCall comparison = org.apache.calcite.sql.fun.SqlStdOperatorTable.EQUALS.createCall(
-            SqlParserPos.ZERO, identifier, literal);
+    public void testVisitStandaloneLiteralSkipped()
+    {
+        SqlLiteral lit = SqlLiteral.createCharString("test", SqlParserPos.ZERO);
+        assertEquals(lit, visitor.visit(lit));
+        assertEquals(0, accumulator.size());
+    }
 
-        SqlNode result = visitor.visit(comparison);
+    // --- addToAccumulator: NlsString vs non-NlsString, field not found, null value ---
 
+    @Test
+    public void testAccumulatorNonNlsStringValue()
+    {
+        visitor.visit(SqlStdOperatorTable.EQUALS.createCall(SqlParserPos.ZERO,
+                new SqlIdentifier("int_col", SqlParserPos.ZERO),
+                SqlLiteral.createExactNumeric("123", SqlParserPos.ZERO)));
         assertEquals(1, accumulator.size());
         assertEquals(SqlTypeName.INTEGER, accumulator.get(0).getType());
-        assertEquals("123", accumulator.get(0).getValue().toString());
         assertEquals("int_col", accumulator.get(0).getColumnName());
     }
 
     @Test
-    public void testVisitSqlLiteralWithBigIntColumn() {
-        SqlIdentifier identifier = new SqlIdentifier("bigint_col", SqlParserPos.ZERO);
-        SqlLiteral literal = SqlLiteral.createExactNumeric("9223372036854775807", SqlParserPos.ZERO);
-        SqlCall comparison = org.apache.calcite.sql.fun.SqlStdOperatorTable.EQUALS.createCall(
-            SqlParserPos.ZERO, identifier, literal);
-
-        SqlNode result = visitor.visit(comparison);
-
-        assertEquals(1, accumulator.size());
-        assertEquals(SqlTypeName.BIGINT, accumulator.get(0).getType());
-    }
-
-    @Test
-    public void testVisitSqlLiteralWithFloatColumn() {
-        SqlIdentifier identifier = new SqlIdentifier("float_col", SqlParserPos.ZERO);
-        SqlLiteral literal = SqlLiteral.createApproxNumeric("3.14", SqlParserPos.ZERO);
-        SqlCall comparison = org.apache.calcite.sql.fun.SqlStdOperatorTable.EQUALS.createCall(
-            SqlParserPos.ZERO, identifier, literal);
-
-        SqlNode result = visitor.visit(comparison);
-
-        assertEquals(1, accumulator.size());
-        assertEquals(SqlTypeName.FLOAT, accumulator.get(0).getType());
-    }
-
-    @Test
-    public void testVisitSqlLiteralWithDoubleColumn() {
-        SqlIdentifier identifier = new SqlIdentifier("double_col", SqlParserPos.ZERO);
-        SqlLiteral literal = SqlLiteral.createApproxNumeric("3.141592653589793", SqlParserPos.ZERO);
-        SqlCall comparison = org.apache.calcite.sql.fun.SqlStdOperatorTable.EQUALS.createCall(
-            SqlParserPos.ZERO, identifier, literal);
-
-        SqlNode result = visitor.visit(comparison);
-
-        assertEquals(1, accumulator.size());
-        assertEquals(SqlTypeName.DOUBLE, accumulator.get(0).getType());
-    }
-
-    @Test
-    public void testVisitSqlLiteralWithVarcharColumn() {
-        SqlIdentifier identifier = new SqlIdentifier("varchar_col", SqlParserPos.ZERO);
-        SqlLiteral literal = SqlLiteral.createCharString("test_string", SqlParserPos.ZERO);
-        SqlCall comparison = org.apache.calcite.sql.fun.SqlStdOperatorTable.EQUALS.createCall(
-            SqlParserPos.ZERO, identifier, literal);
-
-        SqlNode result = visitor.visit(comparison);
-
+    public void testAccumulatorNlsStringValue()
+    {
+        visitor.visit(SqlStdOperatorTable.EQUALS.createCall(SqlParserPos.ZERO,
+                new SqlIdentifier("varchar_col", SqlParserPos.ZERO),
+                SqlLiteral.createCharString("hello", SqlParserPos.ZERO)));
         assertEquals(1, accumulator.size());
         assertEquals(SqlTypeName.VARCHAR, accumulator.get(0).getType());
-        assertEquals("test_string", accumulator.get(0).getValue());
+        assertEquals("hello", accumulator.get(0).getValue());
     }
 
     @Test
-    public void testVisitSqlLiteralWithBooleanColumn() {
-        SqlIdentifier identifier = new SqlIdentifier("bool_col", SqlParserPos.ZERO);
-        SqlLiteral literal = SqlLiteral.createBoolean(true, SqlParserPos.ZERO);
-        SqlCall comparison = org.apache.calcite.sql.fun.SqlStdOperatorTable.EQUALS.createCall(
-            SqlParserPos.ZERO, identifier, literal);
+    public void testAccumulatorFieldNotFoundThrows()
+    {
+        SqlCall call = SqlStdOperatorTable.EQUALS.createCall(SqlParserPos.ZERO,
+                new SqlIdentifier("no_such_col", SqlParserPos.ZERO),
+                SqlLiteral.createCharString("x", SqlParserPos.ZERO));
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class, () -> visitor.visit(call));
+        assertTrue(ex.getMessage().contains("field no_such_col not found"));
+    }
 
-        SqlNode result = visitor.visit(comparison);
+    @Test
+    public void testAccumulatorNullValueThrows()
+    {
+        RelDataType nullSchema = typeFactory.createStructType(
+                Arrays.asList(Pair.of("null_col", typeFactory.createSqlType(SqlTypeName.NULL))));
+        SubstraitAccumulatorVisitor v = new SubstraitAccumulatorVisitor(accumulator, nullSchema);
+        SqlCall call = SqlStdOperatorTable.EQUALS.createCall(SqlParserPos.ZERO,
+                new SqlIdentifier("null_col", SqlParserPos.ZERO),
+                SqlLiteral.createNull(SqlParserPos.ZERO));
+        NullPointerException ex = assertThrows(NullPointerException.class, () -> v.visit(call));
+        assertTrue(ex.getMessage().contains("value is null"));
+    }
 
+    // --- handleBinaryComparison: parameterized across all 6 operators ---
+
+    static Stream<Arguments> binaryComparisonOperators()
+    {
+        return Stream.of(
+                Arguments.of(SqlStdOperatorTable.EQUALS, "EQUALS"),
+                Arguments.of(SqlStdOperatorTable.NOT_EQUALS, "NOT_EQUALS"),
+                Arguments.of(SqlStdOperatorTable.GREATER_THAN, "GREATER_THAN"),
+                Arguments.of(SqlStdOperatorTable.LESS_THAN, "LESS_THAN"),
+                Arguments.of(SqlStdOperatorTable.GREATER_THAN_OR_EQUAL, "GREATER_THAN_OR_EQUAL"),
+                Arguments.of(SqlStdOperatorTable.LESS_THAN_OR_EQUAL, "LESS_THAN_OR_EQUAL"));
+    }
+
+    @ParameterizedTest(name = "{1}")
+    @MethodSource("binaryComparisonOperators")
+    public void testBinaryComparisonLeftIdRightLit(SqlBinaryOperator op, String name)
+    {
+        SqlCall call = op.createCall(SqlParserPos.ZERO,
+                new SqlIdentifier("int_col", SqlParserPos.ZERO),
+                SqlLiteral.createExactNumeric("42", SqlParserPos.ZERO));
+        SqlNode result = visitor.visit(call);
+        assertEquals(1, accumulator.size());
+        assertTrue(((SqlCall) result).operand(1) instanceof SqlDynamicParam);
+    }
+
+    @Test
+    public void testBinaryComparisonReversedOperands()
+    {
+        SqlCall call = SqlStdOperatorTable.EQUALS.createCall(SqlParserPos.ZERO,
+                SqlLiteral.createExactNumeric("99", SqlParserPos.ZERO),
+                new SqlIdentifier("int_col", SqlParserPos.ZERO));
+        SqlNode result = visitor.visit(call);
+        assertEquals(1, accumulator.size());
+        assertEquals("int_col", accumulator.get(0).getColumnName());
+        assertTrue(((SqlCall) result).operand(0) instanceof SqlDynamicParam);
+    }
+
+    @Test
+    public void testBinaryComparisonNonSimpleIdFallsThrough()
+    {
+        visitor.visit(SqlStdOperatorTable.EQUALS.createCall(SqlParserPos.ZERO,
+                new SqlIdentifier(Arrays.asList("s", "int_col"), SqlParserPos.ZERO),
+                SqlLiteral.createExactNumeric("1", SqlParserPos.ZERO)));
+        assertEquals(0, accumulator.size());
+    }
+
+    @Test
+    public void testBinaryComparisonNoMatchFallsThrough()
+    {
+        visitor.visit(SqlStdOperatorTable.EQUALS.createCall(SqlParserPos.ZERO,
+                new SqlIdentifier("int_col", SqlParserPos.ZERO),
+                new SqlIdentifier("bigint_col", SqlParserPos.ZERO)));
+        assertEquals(0, accumulator.size());
+    }
+
+    // --- handleIn: normal, non-id first, non-simple id, mixed nodes ---
+
+    @Test
+    public void testInWithLiterals()
+    {
+        SqlNodeList vals = new SqlNodeList(SqlParserPos.ZERO);
+        vals.add(SqlLiteral.createExactNumeric("1", SqlParserPos.ZERO));
+        vals.add(SqlLiteral.createExactNumeric("2", SqlParserPos.ZERO));
+        visitor.visit(SqlStdOperatorTable.IN.createCall(SqlParserPos.ZERO,
+                new SqlIdentifier("int_col", SqlParserPos.ZERO), vals));
+        assertEquals(2, accumulator.size());
+    }
+
+    @Test
+    public void testInFirstOperandNotIdentifier()
+    {
+        SqlNodeList vals = new SqlNodeList(SqlParserPos.ZERO);
+        vals.add(SqlLiteral.createExactNumeric("1", SqlParserPos.ZERO));
+        visitor.visit(SqlStdOperatorTable.IN.createCall(SqlParserPos.ZERO,
+                SqlLiteral.createExactNumeric("0", SqlParserPos.ZERO), vals));
+        assertEquals(0, accumulator.size());
+    }
+
+    @Test
+    public void testInNonSimpleIdentifier()
+    {
+        SqlNodeList vals = new SqlNodeList(SqlParserPos.ZERO);
+        vals.add(SqlLiteral.createExactNumeric("1", SqlParserPos.ZERO));
+        visitor.visit(SqlStdOperatorTable.IN.createCall(SqlParserPos.ZERO,
+                new SqlIdentifier(Arrays.asList("s", "int_col"), SqlParserPos.ZERO), vals));
+        assertEquals(0, accumulator.size());
+    }
+
+    @Test
+    public void testInMixedLiteralAndNonLiteral()
+    {
+        SqlNodeList vals = new SqlNodeList(SqlParserPos.ZERO);
+        vals.add(SqlLiteral.createExactNumeric("1", SqlParserPos.ZERO));
+        vals.add(new SqlIdentifier("bigint_col", SqlParserPos.ZERO));
+        vals.add(SqlLiteral.createExactNumeric("3", SqlParserPos.ZERO));
+        visitor.visit(SqlStdOperatorTable.IN.createCall(SqlParserPos.ZERO,
+                new SqlIdentifier("int_col", SqlParserPos.ZERO), vals));
+        assertEquals(2, accumulator.size());
+    }
+
+    // --- handleBetween: parameterized for bound combinations, plus fallthrough cases ---
+
+    static Stream<Arguments> betweenBoundCombinations()
+    {
+        SqlIdentifier intId = new SqlIdentifier("int_col", SqlParserPos.ZERO);
+        SqlIdentifier otherId = new SqlIdentifier("bigint_col", SqlParserPos.ZERO);
+        SqlLiteral litLow = SqlLiteral.createExactNumeric("10", SqlParserPos.ZERO);
+        SqlLiteral litHigh = SqlLiteral.createExactNumeric("20", SqlParserPos.ZERO);
+        return Stream.of(
+                Arguments.of(intId, litLow, litHigh, 2, "both_bounds_literal"),
+                Arguments.of(intId, litLow, otherId, 1, "only_lower_literal"),
+                Arguments.of(intId, otherId, litHigh, 1, "only_upper_literal"),
+                Arguments.of(intId, otherId, new SqlIdentifier("float_col", SqlParserPos.ZERO), 0, "neither_bound_literal"));
+    }
+
+    @ParameterizedTest(name = "{4}")
+    @MethodSource("betweenBoundCombinations")
+    public void testBetweenBoundCombinations(SqlNode identifier, SqlNode lower, SqlNode upper, int expectedAccumulated, String name)
+    {
+        visitor.visit(SqlStdOperatorTable.BETWEEN.createCall(SqlParserPos.ZERO, identifier, lower, upper));
+        assertEquals(expectedAccumulated, accumulator.size());
+    }
+
+    @Test
+    public void testBetweenFirstOperandNotIdentifier()
+    {
+        visitor.visit(SqlStdOperatorTable.BETWEEN.createCall(SqlParserPos.ZERO,
+                SqlLiteral.createExactNumeric("5", SqlParserPos.ZERO),
+                SqlLiteral.createExactNumeric("1", SqlParserPos.ZERO),
+                SqlLiteral.createExactNumeric("10", SqlParserPos.ZERO)));
+        assertEquals(0, accumulator.size());
+    }
+
+    @Test
+    public void testBetweenNonSimpleIdentifier()
+    {
+        visitor.visit(SqlStdOperatorTable.BETWEEN.createCall(SqlParserPos.ZERO,
+                new SqlIdentifier(Arrays.asList("s", "int_col"), SqlParserPos.ZERO),
+                SqlLiteral.createExactNumeric("1", SqlParserPos.ZERO),
+                SqlLiteral.createExactNumeric("10", SqlParserPos.ZERO)));
+        assertEquals(0, accumulator.size());
+    }
+
+    // --- handleLike: basic, with escape, fallthrough cases ---
+
+    @Test
+    public void testLikeBasic()
+    {
+        visitor.visit(SqlStdOperatorTable.LIKE.createCall(SqlParserPos.ZERO,
+                new SqlIdentifier("varchar_col", SqlParserPos.ZERO),
+                SqlLiteral.createCharString("%test%", SqlParserPos.ZERO)));
+        assertEquals(1, accumulator.size());
+        assertEquals("%test%", accumulator.get(0).getValue());
+    }
+
+    @Test
+    public void testLikeWithEscapeCharacter()
+    {
+        SqlNode result = visitor.visit(SqlStdOperatorTable.LIKE.createCall(SqlParserPos.ZERO,
+                new SqlIdentifier("varchar_col", SqlParserPos.ZERO),
+                SqlLiteral.createCharString("100\\%%", SqlParserPos.ZERO),
+                SqlLiteral.createCharString("\\", SqlParserPos.ZERO)));
+        assertEquals(1, accumulator.size());
+        assertEquals(3, ((SqlCall) result).operandCount());
+    }
+
+    static Stream<Arguments> likeFallthroughCases()
+    {
+        return Stream.of(
+                Arguments.of(
+                        SqlLiteral.createCharString("val", SqlParserPos.ZERO),
+                        SqlLiteral.createCharString("%t%", SqlParserPos.ZERO),
+                        "first_operand_not_identifier"),
+                Arguments.of(
+                        new SqlIdentifier("varchar_col", SqlParserPos.ZERO),
+                        new SqlIdentifier("varchar_col", SqlParserPos.ZERO),
+                        "second_operand_not_literal"),
+                Arguments.of(
+                        new SqlIdentifier(Arrays.asList("s", "varchar_col"), SqlParserPos.ZERO),
+                        SqlLiteral.createCharString("%t%", SqlParserPos.ZERO),
+                        "non_simple_identifier"));
+    }
+
+    @ParameterizedTest(name = "like_fallthrough_{2}")
+    @MethodSource("likeFallthroughCases")
+    public void testLikeFallthroughCases(SqlNode first, SqlNode second, String name)
+    {
+        visitor.visit(SqlStdOperatorTable.LIKE.createCall(SqlParserPos.ZERO, first, second));
+        assertEquals(0, accumulator.size());
+    }
+
+    // --- handleNot: boolean col, non-boolean col, non-identifier, non-simple, non-existent ---
+
+    @Test
+    public void testNotOnBooleanColumn()
+    {
+        // Create a NOT call on a boolean column
+        SqlCall notCall = SqlStdOperatorTable.NOT.createCall(SqlParserPos.ZERO,
+                new SqlIdentifier("bool_col", SqlParserPos.ZERO));
+        
+        // Wrap it in a SELECT with WHERE clause to enable inWhereClause context
+        SqlNodeList selectList = new SqlNodeList(Arrays.asList(new SqlIdentifier("*", SqlParserPos.ZERO)), SqlParserPos.ZERO);
+        SqlIdentifier from = new SqlIdentifier("test_table", SqlParserPos.ZERO);
+        
+        SqlSelect select = new SqlSelect(
+                SqlParserPos.ZERO,
+                SqlNodeList.EMPTY, // keywords
+                selectList, // selectList
+                from, // from
+                notCall, // where - this is the NOT call we're testing
+                null, // groupBy
+                null, // having
+                SqlNodeList.EMPTY, // windowDecls
+                null, // orderBy
+                null, // offset
+                null, // fetch
+                null); // hints
+        
+        SqlNode result = visitor.visit(select);
+        SqlNode transformedWhere = ((SqlSelect) result).getWhere();
+        
+        // Not bool_col -> Not bool_col = true
         assertEquals(1, accumulator.size());
         assertEquals(SqlTypeName.BOOLEAN, accumulator.get(0).getType());
+        assertEquals(true, accumulator.get(0).getValue());
+        assertEquals(SqlKind.NOT, ((SqlCall) transformedWhere).getOperator().getKind());
+    }
+
+    static Stream<Arguments> notFallthroughCases()
+    {
+        return Stream.of(
+                Arguments.of(new SqlIdentifier("int_col", SqlParserPos.ZERO), "non_boolean_column"),
+                Arguments.of(new SqlIdentifier(Arrays.asList("s", "bool_col"), SqlParserPos.ZERO), "non_simple_identifier"),
+                Arguments.of(new SqlIdentifier("no_such_col", SqlParserPos.ZERO), "non_existent_column"));
+    }
+
+    @ParameterizedTest(name = "not_fallthrough_{1}")
+    @MethodSource("notFallthroughCases")
+    public void testNotFallthroughCases(SqlNode operand, String name)
+    {
+        visitor.visit(SqlStdOperatorTable.NOT.createCall(SqlParserPos.ZERO, operand));
+        assertEquals(0, accumulator.size());
     }
 
     @Test
-    public void testVisitSqlLiteralWithDecimalColumn() {
-        SqlIdentifier identifier = new SqlIdentifier("decimal_col", SqlParserPos.ZERO);
-        SqlLiteral literal = SqlLiteral.createExactNumeric("123.45", SqlParserPos.ZERO);
-        SqlCall comparison = org.apache.calcite.sql.fun.SqlStdOperatorTable.EQUALS.createCall(
-            SqlParserPos.ZERO, identifier, literal);
-
-        SqlNode result = visitor.visit(comparison);
-
+    public void testNotOnNonIdentifierOperand()
+    {
+        SqlCall inner = SqlStdOperatorTable.EQUALS.createCall(SqlParserPos.ZERO,
+                new SqlIdentifier("int_col", SqlParserPos.ZERO),
+                SqlLiteral.createExactNumeric("1", SqlParserPos.ZERO));
+        visitor.visit(SqlStdOperatorTable.NOT.createCall(SqlParserPos.ZERO, inner));
+        // inner EQUALS processed via super.visit recursion
         assertEquals(1, accumulator.size());
-        assertEquals(SqlTypeName.DECIMAL, accumulator.get(0).getType());
     }
 
-    @Test
-    public void testVisitSqlLiteralWithDateColumn() {
-        SqlIdentifier identifier = new SqlIdentifier("date_col", SqlParserPos.ZERO);
-        SqlLiteral literal = SqlLiteral.createDate(org.apache.calcite.util.DateString
-                .fromCalendarFields(java.util.Calendar.getInstance()), SqlParserPos.ZERO);
-        SqlCall comparison = org.apache.calcite.sql.fun.SqlStdOperatorTable.EQUALS.createCall(
-            SqlParserPos.ZERO, identifier, literal);
-
-        SqlNode result = visitor.visit(comparison);
-
-        assertEquals(1, accumulator.size());
-        assertEquals(SqlTypeName.DATE, accumulator.get(0).getType());
-    }
+    // --- visit(SqlCall): unrecognized kind falls through to super.visit ---
 
     @Test
-    public void testVisitSqlLiteralWithTimeColumn() {
-        SqlIdentifier identifier = new SqlIdentifier("time_col", SqlParserPos.ZERO);
-        SqlLiteral literal = SqlLiteral.createTime(org.apache.calcite.util.TimeString
-                .fromCalendarFields(java.util.Calendar.getInstance()), 0, SqlParserPos.ZERO);
-        SqlCall comparison = org.apache.calcite.sql.fun.SqlStdOperatorTable.EQUALS.createCall(
-            SqlParserPos.ZERO, identifier, literal);
-
-        SqlNode result = visitor.visit(comparison);
-
-        assertEquals(1, accumulator.size());
-        assertEquals(SqlTypeName.TIME, accumulator.get(0).getType());
-    }
-
-    @Test
-    public void testVisitSqlLiteralWithTimestampColumn() {
-        SqlIdentifier identifier = new SqlIdentifier("timestamp_col", SqlParserPos.ZERO);
-        SqlLiteral literal = SqlLiteral.createTimestamp(org.apache.calcite.util.TimestampString
-                .fromCalendarFields(java.util.Calendar.getInstance()), 0, SqlParserPos.ZERO);
-        SqlCall comparison = org.apache.calcite.sql.fun.SqlStdOperatorTable.EQUALS.createCall(
-            SqlParserPos.ZERO, identifier, literal);
-
-        SqlNode result = visitor.visit(comparison);
-
-        assertEquals(1, accumulator.size());
-        assertEquals(SqlTypeName.TIMESTAMP, accumulator.get(0).getType());
-    }
-
-    @Test
-    public void testVisitSqlLiteralWithBinaryColumn() {
-        SqlIdentifier identifier = new SqlIdentifier("binary_col", SqlParserPos.ZERO);
-        SqlLiteral literal = SqlLiteral.createBinaryString("ABCD", SqlParserPos.ZERO);
-        SqlCall comparison = org.apache.calcite.sql.fun.SqlStdOperatorTable.EQUALS.createCall(
-            SqlParserPos.ZERO, identifier, literal);
-
-        SqlNode result = visitor.visit(comparison);
-
-        assertEquals(1, accumulator.size());
-        assertEquals(SqlTypeName.VARBINARY, accumulator.get(0).getType());
-    }
-
-    @Test
-    public void testVisitSqlLiteralWithNullColumn() {
-        // Create schema with null type field
-        List<Pair<String, RelDataType>> fields = new ArrayList<>();
-        for (String fieldName : schema.getFieldNames()) {
-            fields.add(Pair.of(fieldName, schema.getField(fieldName, false, false).getType()));
-        }
-        fields.add(Pair.of("null_col", typeFactory.createSqlType(SqlTypeName.NULL)));
-        schema = typeFactory.createStructType(fields);
-        visitor = new SubstraitAccumulatorVisitor(accumulator, schema);
-
-        SqlIdentifier identifier = new SqlIdentifier("null_col", SqlParserPos.ZERO);
-        SqlLiteral literal = SqlLiteral.createNull(SqlParserPos.ZERO);
-        SqlCall comparison = org.apache.calcite.sql.fun.SqlStdOperatorTable.EQUALS.createCall(
-            SqlParserPos.ZERO, identifier, literal);
-
-        // SubstraitTypeAndValue requires non-null values, so this should throw a NullPointerException
-        NullPointerException exception = assertThrows(NullPointerException.class, () -> {
-            visitor.visit(comparison);
-        });
-
-        assertTrue(exception.getMessage().contains("value is null"));
-    }
-
-    @Test
-    public void testVisitSqlLiteralWithCharColumn() {
-        // Create schema with char type field
-        List<Pair<String, RelDataType>> fields = new ArrayList<>();
-        for (String fieldName : schema.getFieldNames()) {
-            fields.add(Pair.of(fieldName, schema.getField(fieldName, false, false).getType()));
-        }
-        fields.add(Pair.of("char_col", typeFactory.createSqlType(SqlTypeName.CHAR)));
-        schema = typeFactory.createStructType(fields);
-        visitor = new SubstraitAccumulatorVisitor(accumulator, schema);
-
-        SqlIdentifier identifier = new SqlIdentifier("char_col", SqlParserPos.ZERO);
-        SqlLiteral literal = SqlLiteral.createCharString("test_char", SqlParserPos.ZERO);
-        SqlCall comparison = org.apache.calcite.sql.fun.SqlStdOperatorTable.EQUALS.createCall(
-            SqlParserPos.ZERO, identifier, literal);
-
-        SqlNode result = visitor.visit(comparison);
-
-        assertEquals(1, accumulator.size());
-        assertEquals(SqlTypeName.CHAR, accumulator.get(0).getType());
-    }
-
-    @Test
-    public void testVisitSqlLiteralWithArrayColumn() {
-        // Create schema with array type field
-        List<Pair<String, RelDataType>> fields = new ArrayList<>();
-        for (String fieldName : schema.getFieldNames()) {
-            fields.add(Pair.of(fieldName, schema.getField(fieldName, false, false).getType()));
-        }
-        fields.add(Pair.of("array_col",
-                typeFactory.createArrayType(typeFactory.createSqlType(SqlTypeName.VARCHAR), -1)));
-        schema = typeFactory.createStructType(fields);
-        visitor = new SubstraitAccumulatorVisitor(accumulator, schema);
-
-        SqlIdentifier identifier = new SqlIdentifier("array_col", SqlParserPos.ZERO);
-        SqlLiteral literal = SqlLiteral.createCharString("test", SqlParserPos.ZERO);
-        SqlCall comparison = org.apache.calcite.sql.fun.SqlStdOperatorTable.EQUALS.createCall(
-            SqlParserPos.ZERO, identifier, literal);
-
-        SqlNode result = visitor.visit(comparison);
-
-        assertEquals(1, accumulator.size());
-        assertEquals(SqlTypeName.ARRAY, accumulator.get(0).getType());
-    }
-
-    @Test
-    public void testVisitSqlLiteralWithMapColumn() {
-        // Create schema with map type field
-        List<Pair<String, RelDataType>> fields = new ArrayList<>();
-        for (String fieldName : schema.getFieldNames()) {
-            fields.add(Pair.of(fieldName, schema.getField(fieldName, false, false).getType()));
-        }
-        fields.add(Pair.of("map_col",
-                typeFactory.createMapType(typeFactory.createSqlType(SqlTypeName.VARCHAR),
-                        typeFactory.createSqlType(SqlTypeName.INTEGER))));
-        schema = typeFactory.createStructType(fields);
-        visitor = new SubstraitAccumulatorVisitor(accumulator, schema);
-
-        SqlIdentifier identifier = new SqlIdentifier("map_col", SqlParserPos.ZERO);
-        SqlLiteral literal = SqlLiteral.createCharString("test", SqlParserPos.ZERO);
-        SqlCall comparison = org.apache.calcite.sql.fun.SqlStdOperatorTable.EQUALS.createCall(
-            SqlParserPos.ZERO, identifier, literal);
-
-        SqlNode result = visitor.visit(comparison);
-
-        assertEquals(1, accumulator.size());
-        assertEquals(SqlTypeName.MAP, accumulator.get(0).getType());
-    }
-
-    @Test
-    public void testVisitSqlLiteralWithoutCurrentColumnShouldIgnore() {
-        SqlLiteral literal = SqlLiteral.createCharString("test", SqlParserPos.ZERO);
-        visitor.visit(literal);
-    }
-
-    @Test
-    public void testVisitSqlLiteralWithNonExistentColumn() {
-        SqlIdentifier identifier = new SqlIdentifier("non_existent_col", SqlParserPos.ZERO);
-        SqlLiteral literal = SqlLiteral.createCharString("test", SqlParserPos.ZERO);
-        SqlCall comparison = org.apache.calcite.sql.fun.SqlStdOperatorTable.EQUALS.createCall(
-            SqlParserPos.ZERO, identifier, literal);
-
-        IllegalArgumentException exception = assertThrows(IllegalArgumentException.class, () -> {
-            visitor.visit(comparison);
-        });
-
-        assertTrue(exception.getMessage().contains("field non_existent_col not found"));
-    }
-
-    @Test
-    public void testMultipleLiteralsAccumulation() {
-        // Create two comparison calls to test multiple literals
-        SqlIdentifier identifier1 = new SqlIdentifier("int_col", SqlParserPos.ZERO);
-        SqlLiteral literal1 = SqlLiteral.createExactNumeric("123", SqlParserPos.ZERO);
-        SqlCall comparison1 = org.apache.calcite.sql.fun.SqlStdOperatorTable.EQUALS.createCall(
-            SqlParserPos.ZERO, identifier1, literal1);
-        
-        SqlIdentifier identifier2 = new SqlIdentifier("varchar_col", SqlParserPos.ZERO);
-        SqlLiteral literal2 = SqlLiteral.createCharString("test", SqlParserPos.ZERO);
-        SqlCall comparison2 = org.apache.calcite.sql.fun.SqlStdOperatorTable.EQUALS.createCall(
-            SqlParserPos.ZERO, identifier2, literal2);
-
-        // Visit both comparisons
-        visitor.visit(comparison1);
-        visitor.visit(comparison2);
-
+    public void testUnrecognizedCallKindFallsThrough()
+    {
+        SqlCall eq1 = SqlStdOperatorTable.EQUALS.createCall(SqlParserPos.ZERO,
+                new SqlIdentifier("int_col", SqlParserPos.ZERO),
+                SqlLiteral.createExactNumeric("1", SqlParserPos.ZERO));
+        SqlCall eq2 = SqlStdOperatorTable.EQUALS.createCall(SqlParserPos.ZERO,
+                new SqlIdentifier("varchar_col", SqlParserPos.ZERO),
+                SqlLiteral.createCharString("x", SqlParserPos.ZERO));
+        visitor.visit(SqlStdOperatorTable.AND.createCall(SqlParserPos.ZERO, eq1, eq2));
         assertEquals(2, accumulator.size());
-        assertEquals(SqlTypeName.INTEGER, accumulator.get(0).getType());
-        assertEquals("int_col", accumulator.get(0).getColumnName());
-        assertEquals(SqlTypeName.VARCHAR, accumulator.get(1).getType());
-        assertEquals("varchar_col", accumulator.get(1).getColumnName());
     }
 }

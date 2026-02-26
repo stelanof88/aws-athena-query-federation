@@ -448,7 +448,6 @@ public abstract class JdbcSplitQueryBuilder
             SubstraitAccumulatorVisitor visitor = new SubstraitAccumulatorVisitor(accumulator, tableSchema);
             SqlNode parameterizedNode = visitor.visit(root);
             
-            
             LOGGER.debug("CalciteSql parameterized sql with dialect {}: {}", sqlDialect.toString(), parameterizedNode.toSqlString(sqlDialect).getSql());
             LOGGER.debug("CalciteSql parameters: {}", accumulator.toString());
             
@@ -512,7 +511,7 @@ public abstract class JdbcSplitQueryBuilder
                     break;
                 case DATE:
                     if (typeAndValue.getValue() instanceof Number) {
-                        // Assume days since epoch for numeric date values
+                        // Assume days since epoch for numeric date values which is documented by Calcite.
                         long numericValue = ((Number) typeAndValue.getValue()).longValue();
                         long utcMillis = numericValue * 24L * 60L * 60L * 1000L; // days → ms
                         int offsetVal = TimeZone.getDefault().getOffset(utcMillis);
