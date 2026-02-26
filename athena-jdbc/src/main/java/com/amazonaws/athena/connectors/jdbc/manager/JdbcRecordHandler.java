@@ -257,6 +257,15 @@ public abstract class JdbcRecordHandler
             };
         }
 
+        // Check if column exists in ResultSet - if not, return null extractor
+        try {
+            resultSet.findColumn(fieldName);
+        }
+        catch (SQLException e) {
+            LOGGER.debug("Column {} not found in ResultSet, returning null extractor", fieldName);
+            return makeNullExtractor(fieldType);
+        }
+
         switch (fieldType) {
             case BIT:
                 return (BitExtractor) (Object context, NullableBitHolder dst) ->
@@ -399,5 +408,38 @@ public abstract class JdbcRecordHandler
     protected SqlDialect getSqlDialect() 
     {
         return AnsiSqlDialect.DEFAULT;
+    }
+    
+    private Extractor makeNullExtractor(Types.MinorType fieldType)
+    {
+        switch (fieldType) {
+            case BIT:
+                return (BitExtractor) (Object context, NullableBitHolder dst) -> dst.isSet = 0;
+            case TINYINT:
+                return (TinyIntExtractor) (Object context, NullableTinyIntHolder dst) -> dst.isSet = 0;
+            case SMALLINT:
+                return (SmallIntExtractor) (Object context, NullableSmallIntHolder dst) -> dst.isSet = 0;
+            case INT:
+                return (IntExtractor) (Object context, NullableIntHolder dst) -> dst.isSet = 0;
+            case BIGINT:
+                return (BigIntExtractor) (Object context, NullableBigIntHolder dst) -> dst.isSet = 0;
+            case FLOAT4:
+                return (Float4Extractor) (Object context, NullableFloat4Holder dst) -> dst.isSet = 0;
+            case FLOAT8:
+                return (Float8Extractor) (Object context, NullableFloat8Holder dst) -> dst.isSet = 0;
+            case DECIMAL:
+                return (DecimalExtractor) (Object context, NullableDecimalHolder dst) -> dst.isSet = 0;
+            case DATEDAY:
+                return (DateDayExtractor) (Object context, NullableDateDayHolder dst) -> dst.isSet = 0;
+            case DATEMILLI:
+                return (DateMilliExtractor) (Object context, NullableDateMilliHolder dst) -> dst.isSet = 0;
+            case VARCHAR:
+                return (VarCharExtractor) (Object context, NullableVarCharHolder dst) -> dst.isSet = 0;
+            case VARBINARY:
+                return (VarBinaryExtractor) (Object context, NullableVarBinaryHolder dst) -> dst.isSet = 0;
+            default:
+                throw new AthenaConnectorException("Unhandled type " + fieldType,
+                        ErrorDetails.builder().errorCode(FederationSourceErrorCode.OPERATION_NOT_SUPPORTED_EXCEPTION.toString()).build());
+        }
     }
 }

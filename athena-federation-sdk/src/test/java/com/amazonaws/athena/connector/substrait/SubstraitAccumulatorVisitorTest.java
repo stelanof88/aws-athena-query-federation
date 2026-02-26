@@ -370,8 +370,8 @@ public class SubstraitAccumulatorVisitorTest
         // Not bool_col -> Not bool_col = true
         assertEquals(1, accumulator.size());
         assertEquals(SqlTypeName.BOOLEAN, accumulator.get(0).getType());
-        assertEquals(true, accumulator.get(0).getValue());
-        assertEquals(SqlKind.NOT, ((SqlCall) transformedWhere).getOperator().getKind());
+        assertEquals(false, accumulator.get(0).getValue());
+        assertEquals(SqlKind.EQUALS, ((SqlCall) transformedWhere).getOperator().getKind());
     }
 
     static Stream<Arguments> notFallthroughCases()
@@ -414,5 +414,43 @@ public class SubstraitAccumulatorVisitorTest
                 SqlLiteral.createCharString("x", SqlParserPos.ZERO));
         visitor.visit(SqlStdOperatorTable.AND.createCall(SqlParserPos.ZERO, eq1, eq2));
         assertEquals(2, accumulator.size());
+    }
+
+    @Test
+    public void testVisitLikeWithConcat() {
+        // Test for: select * from call_center where cc_call_center_id like concat(cc_call_center_id, 'a') limit 10;
+        // This tests an edge case where LIKE has a function call (CONCAT) as the pattern instead of a direct literal.
+        // The visitor should recursively traverse into the CONCAT function and accumulate any literals found there,
+        // associating them with the column from the LIKE clause.
+        
+        // Create schema with cc_call_center_id column
+        List<Pair<String, RelDataType>> fields = new ArrayList<>();
+        fields.add(Pair.of("cc_call_center_id", typeFactory.createSqlType(SqlTypeName.VARCHAR)));
+        RelDataType callCenterSchema = typeFactory.createStructType(fields);
+        SubstraitAccumulatorVisitor callCenterVisitor = new SubstraitAccumulatorVisitor(accumulator, callCenterSchema);
+
+        // Create the LIKE expression: cc_call_center_id LIKE CONCAT(cc_call_center_id, 'a')
+        SqlIdentifier ccCallCenterId = new SqlIdentifier("cc_call_center_id", SqlParserPos.ZERO);
+        SqlLiteral literalA = SqlLiteral.createCharString("a", SqlParserPos.ZERO);
+        
+        // Create CONCAT(cc_call_center_id, 'a')
+        SqlCall concatCall = org.apache.calcite.sql.fun.SqlStdOperatorTable.CONCAT.createCall(
+            SqlParserPos.ZERO, ccCallCenterId, literalA);
+        
+        // Create LIKE expression: cc_call_center_id LIKE CONCAT(...)
+        SqlCall likeCall = org.apache.calcite.sql.fun.SqlStdOperatorTable.LIKE.createCall(
+            SqlParserPos.ZERO, ccCallCenterId, concatCall);
+
+        SqlNode result = callCenterVisitor.visit(likeCall);
+
+        // Verify that the literal 'a' in the CONCAT was accumulated
+        // The refactored visitor now properly handles function calls in LIKE patterns by:
+        // 1. Pushing the column context onto the stack
+        // 2. Recursively visiting the pattern (CONCAT in this case)
+        // 3. The literal 'a' inside CONCAT is visited with column context and gets accumulated
+        assertEquals(1, accumulator.size());
+        assertEquals(SqlTypeName.VARCHAR, accumulator.get(0).getType());
+        assertEquals("a", accumulator.get(0).getValue());
+        assertEquals("cc_call_center_id", accumulator.get(0).getColumnName());
     }
 }

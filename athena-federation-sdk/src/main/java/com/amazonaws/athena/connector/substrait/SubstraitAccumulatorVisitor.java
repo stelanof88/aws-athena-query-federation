@@ -28,7 +28,6 @@ import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.SqlLiteral;
 import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.SqlNodeList;
-import org.apache.calcite.sql.SqlSelect;
 import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.calcite.sql.util.SqlShuttle;
 import org.apache.calcite.util.NlsString;
@@ -85,12 +84,17 @@ public class SubstraitAccumulatorVisitor extends SqlShuttle
     @Override
     public SqlNode visit(SqlCall call)
     {
-        // Handle SqlSelect specially to track WHERE clause context
-        if (call instanceof SqlSelect) {
-            return handleSelect((SqlSelect) call);
-        }
-
         SqlKind kind = call.getOperator().getKind();
+        
+        // Handle AND/OR operators - may contain standalone boolean columns
+        if (kind == SqlKind.AND || kind == SqlKind.OR) {
+            return handleLogicalOperator(call);
+        }
+        
+        // Handle NOT operator on boolean columns: NOT bool_col -> bool_col = FALSE
+        if (kind == SqlKind.NOT) {
+            return handleNot(call);
+        }
         
         // Binary comparisons: col = val, col > val, etc.
         if (isBinaryComparison(kind)) {
@@ -112,21 +116,17 @@ public class SubstraitAccumulatorVisitor extends SqlShuttle
             return handleLike(call);
         }
         
+        // IS NULL / IS NOT NULL: col IS NULL
+        if (kind == SqlKind.IS_NULL || kind == SqlKind.IS_NOT_NULL) {
+            return handleIsNull(call);
+        }
+        
         return super.visit(call);
     }
 
     @Override
     public SqlNode visit(SqlIdentifier id)
     {
-        if (inWhereClause && id.isSimple() && isBooleanColumn(id.getSimple())) {
-            // Transform bool_col to bool_col = TRUE
-            SqlLiteral trueLiteral = SqlLiteral.createBoolean(true, id.getParserPosition());
-            addToAccumulator(id.getSimple(), trueLiteral);
-            SqlDynamicParam param =
-                    new SqlDynamicParam(accumulator.size() - 1, trueLiteral.getParserPosition());
-            return org.apache.calcite.sql.fun.SqlStdOperatorTable.EQUALS
-                    .createCall(id.getParserPosition(), id, param);
-        }
         if (id.isSimple()) {
             columnStack.push(id.getSimple());
         }
@@ -135,12 +135,6 @@ public class SubstraitAccumulatorVisitor extends SqlShuttle
             columnStack.pop();
         }
         return result;
-    }
-    
-    private boolean isBooleanColumn(String columnName)
-    {
-        RelDataTypeField field = schema.getField(columnName, true, true);
-        return field != null && field.getType().getSqlTypeName() == SqlTypeName.BOOLEAN;
     }
 
     @Override
@@ -157,33 +151,49 @@ public class SubstraitAccumulatorVisitor extends SqlShuttle
         return new SqlDynamicParam(accumulator.size() - 1, literal.getParserPosition());
     }
 
+    private boolean isBinaryComparison(SqlKind kind)
+    {
+        return kind == SqlKind.EQUALS || kind == SqlKind.NOT_EQUALS
+            || kind == SqlKind.GREATER_THAN || kind == SqlKind.LESS_THAN
+            || kind == SqlKind.GREATER_THAN_OR_EQUAL || kind == SqlKind.LESS_THAN_OR_EQUAL;
+    }
+
     private SqlNode handleBinaryComparison(SqlCall call)
     {
         SqlNode left = call.operand(0);
         SqlNode right = call.operand(1);
         
+        // Identify which operand is the column identifier
         SqlIdentifier identifier = null;
-        SqlLiteral literal = null;
-        int literalIndex = -1;
+        SqlNode valueOperand = null;
+        int valueIndex = -1;
         
-        if (left instanceof SqlIdentifier && right instanceof SqlLiteral) {
+        if (left instanceof SqlIdentifier && ((SqlIdentifier) left).isSimple()) {
             identifier = (SqlIdentifier) left;
-            literal = (SqlLiteral) right;
-            literalIndex = 1;
+            valueOperand = right;
+            valueIndex = 1;
         }
-        else if (right instanceof SqlIdentifier && left instanceof SqlLiteral) {
+        else if (right instanceof SqlIdentifier && ((SqlIdentifier) right).isSimple()) {
             identifier = (SqlIdentifier) right;
-            literal = (SqlLiteral) left;
-            literalIndex = 0;
+            valueOperand = left;
+            valueIndex = 0;
         }
         
-        if (identifier != null && literal != null && identifier.isSimple()) {
+        if (identifier != null && valueOperand != null) {
             String columnName = identifier.getSimple();
-            addToAccumulator(columnName, literal);
             
-            SqlNode[] operands = call.getOperandList().toArray(new SqlNode[0]);
-            operands[literalIndex] = new SqlDynamicParam(accumulator.size() - 1, literal.getParserPosition());
-            return call.getOperator().createCall(call.getParserPosition(), operands);
+            // Push column context and recursively visit the value operand
+            // This will automatically handle literals, function calls, or any nested structure
+            columnStack.push(columnName);
+            SqlNode newValueOperand = valueOperand.accept(this);
+            columnStack.pop();
+            
+            // If the value operand was modified (literals replaced with dynamic params), reconstruct the call
+            if (newValueOperand != valueOperand) {
+                SqlNode[] operands = call.getOperandList().toArray(new SqlNode[0]);
+                operands[valueIndex] = newValueOperand;
+                return call.getOperator().createCall(call.getParserPosition(), operands);
+            }
         }
         
         return super.visit(call);
@@ -206,18 +216,22 @@ public class SubstraitAccumulatorVisitor extends SqlShuttle
         if (valueListNode instanceof SqlNodeList) {
             SqlNodeList valueList = (SqlNodeList) valueListNode;
             SqlNodeList newList = new SqlNodeList(valueList.getParserPosition());
+            boolean modified = false;
             
+            // Push column context and recursively visit each value in the list
+            columnStack.push(columnName);
             for (SqlNode node : valueList) {
-                if (node instanceof SqlLiteral) {
-                    addToAccumulator(columnName, (SqlLiteral) node);
-                    newList.add(new SqlDynamicParam(accumulator.size() - 1, node.getParserPosition()));
-                }
-                else {
-                    newList.add(node);
+                SqlNode newNode = node.accept(this);
+                newList.add(newNode);
+                if (newNode != node) {
+                    modified = true;
                 }
             }
+            columnStack.pop();
             
-            return call.getOperator().createCall(call.getParserPosition(), identifier, newList);
+            if (modified) {
+                return call.getOperator().createCall(call.getParserPosition(), identifier, newList);
+            }
         }
         
         return super.visit(call);
@@ -238,18 +252,12 @@ public class SubstraitAccumulatorVisitor extends SqlShuttle
         SqlNode lower = call.operand(1);
         SqlNode upper = call.operand(2);
         
-        SqlNode newLower = lower;
-        SqlNode newUpper = upper;
-        
-        if (lower instanceof SqlLiteral) {
-            addToAccumulator(columnName, (SqlLiteral) lower);
-            newLower = new SqlDynamicParam(accumulator.size() - 1, lower.getParserPosition());
-        }
-        
-        if (upper instanceof SqlLiteral) {
-            addToAccumulator(columnName, (SqlLiteral) upper);
-            newUpper = new SqlDynamicParam(accumulator.size() - 1, upper.getParserPosition());
-        }
+        // Push column context and recursively visit both bounds
+        // This handles literals, function calls, or any nested structure
+        columnStack.push(columnName);
+        SqlNode newLower = lower.accept(this);
+        SqlNode newUpper = upper.accept(this);
+        columnStack.pop();
         
         if (newLower != lower || newUpper != upper) {
             return call.getOperator().createCall(call.getParserPosition(), identifier, newLower, newUpper);
@@ -260,7 +268,7 @@ public class SubstraitAccumulatorVisitor extends SqlShuttle
 
     private SqlNode handleLike(SqlCall call)
     {
-        if (!(call.operand(0) instanceof SqlIdentifier) || !(call.operand(1) instanceof SqlLiteral)) {
+        if (!(call.operand(0) instanceof SqlIdentifier)) {
             return super.visit(call);
         }
         
@@ -270,17 +278,85 @@ public class SubstraitAccumulatorVisitor extends SqlShuttle
         }
         
         String columnName = identifier.getSimple();
-        SqlLiteral literal = (SqlLiteral) call.operand(1);
+        SqlNode pattern = call.operand(1);
         
-        addToAccumulator(columnName, literal);
+        // Push column context and recursively visit the pattern
+        // This handles literals, function calls (like CONCAT), or any nested structure
+        columnStack.push(columnName);
+        SqlNode newPattern = pattern.accept(this);
+        columnStack.pop();
         
-        SqlNode newPattern = new SqlDynamicParam(accumulator.size() - 1, literal.getParserPosition());
-        
-        if (call.operandCount() == 3) {
-            return call.getOperator().createCall(call.getParserPosition(), identifier, newPattern, call.operand(2));
+        if (newPattern != pattern) {
+            if (call.operandCount() == 3) {
+                return call.getOperator().createCall(call.getParserPosition(), identifier, newPattern, call.operand(2));
+            }
+            return call.getOperator().createCall(call.getParserPosition(), identifier, newPattern);
         }
         
-        return call.getOperator().createCall(call.getParserPosition(), identifier, newPattern);
+        return super.visit(call);
+    }
+
+    private SqlNode handleLogicalOperator(SqlCall call)
+    {
+        // Handle AND/OR operators that may contain standalone boolean columns
+        SqlNode[] newOperands = new SqlNode[call.operandCount()];
+        boolean modified = false;
+        
+        for (int i = 0; i < call.operandCount(); i++) {
+            SqlNode operand = call.operand(i);
+            
+            // Check if operand is a standalone boolean identifier
+            if (operand instanceof SqlIdentifier) {
+                SqlIdentifier identifier = (SqlIdentifier) operand;
+                if (identifier.isSimple() && isBooleanColumn(identifier.getSimple())) {
+                    // Transform bool_col to bool_col = TRUE
+                    SqlLiteral trueLiteral = SqlLiteral.createBoolean(true, identifier.getParserPosition());
+                    addToAccumulator(identifier.getSimple(), trueLiteral);
+                    SqlDynamicParam param = new SqlDynamicParam(accumulator.size() - 1, trueLiteral.getParserPosition());
+                    newOperands[i] = org.apache.calcite.sql.fun.SqlStdOperatorTable.EQUALS.createCall(
+                        identifier.getParserPosition(), identifier, param);
+                    modified = true;
+                    continue;
+                }
+            }
+            
+            // Otherwise, recursively process the operand
+            newOperands[i] = operand.accept(this);
+            if (newOperands[i] != operand) {
+                modified = true;
+            }
+        }
+        
+        if (modified) {
+            return call.getOperator().createCall(call.getParserPosition(), newOperands);
+        }
+        return call;
+    }
+    
+    private SqlNode handleNot(SqlCall call)
+    {
+        // Handle NOT operator on boolean columns: NOT bool_col -> bool_col = FALSE
+        if (call.operandCount() == 1) {
+            SqlNode operand = call.operand(0);
+            if (operand instanceof SqlIdentifier) {
+                SqlIdentifier identifier = (SqlIdentifier) operand;
+                if (identifier.isSimple() && isBooleanColumn(identifier.getSimple())) {
+                    // Transform NOT bool_col to bool_col = FALSE
+                    SqlLiteral falseLiteral = SqlLiteral.createBoolean(false, identifier.getParserPosition());
+                    addToAccumulator(identifier.getSimple(), falseLiteral);
+                    SqlDynamicParam param = new SqlDynamicParam(accumulator.size() - 1, falseLiteral.getParserPosition());
+                    return org.apache.calcite.sql.fun.SqlStdOperatorTable.EQUALS.createCall(
+                        identifier.getParserPosition(), identifier, param);
+                }
+            }
+        }
+        return super.visit(call);
+    }
+    
+    private SqlNode handleIsNull(SqlCall call)
+    {
+        // IS NULL doesn't have a literal to parameterize, just traverse
+        return super.visit(call);
     }
 
     private void addToAccumulator(String columnName, SqlLiteral literal)
@@ -299,34 +375,9 @@ public class SubstraitAccumulatorVisitor extends SqlShuttle
         accumulator.add(new SubstraitTypeAndValue(typeName, value, columnName));
     }
     
-    private SqlNode handleSelect(SqlSelect select)
+    private boolean isBooleanColumn(String columnName)
     {
-        // Visit WHERE clause with inWhereClause flag set
-        SqlNode where = select.getWhere();
-        SqlNode newWhere = null;
-        if (where != null) {
-            boolean prev = inWhereClause;
-            inWhereClause = true;
-            newWhere = where.accept(this);
-            inWhereClause = prev;
-        }
-
-        // Temporarily null out WHERE so super.visit() doesn't re-traverse it
-        select.setWhere(null);
-
-        // Let the default SqlShuttle traversal handle all other clauses
-        // (SELECT list, FROM, GROUP BY, HAVING, WINDOW, ORDER BY, OFFSET, FETCH, etc.)
-        SqlSelect result = (SqlSelect) super.visit(select);
-
-        // Restore the (transformed) WHERE clause
-        result.setWhere(newWhere);
-        return result;
-    }
-
-    private boolean isBinaryComparison(SqlKind kind)
-    {
-        return kind == SqlKind.EQUALS || kind == SqlKind.NOT_EQUALS
-            || kind == SqlKind.GREATER_THAN || kind == SqlKind.LESS_THAN
-            || kind == SqlKind.GREATER_THAN_OR_EQUAL || kind == SqlKind.LESS_THAN_OR_EQUAL;
+        RelDataTypeField field = schema.getField(columnName, true, true);
+        return field != null && field.getType().getSqlTypeName() == SqlTypeName.BOOLEAN;
     }
 }
