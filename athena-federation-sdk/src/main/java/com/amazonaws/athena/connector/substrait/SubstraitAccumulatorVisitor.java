@@ -28,6 +28,7 @@ import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.SqlLiteral;
 import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.SqlNodeList;
+import org.apache.calcite.sql.SqlSelect;
 import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.calcite.sql.util.SqlShuttle;
 import org.apache.calcite.util.NlsString;
@@ -86,6 +87,10 @@ public class SubstraitAccumulatorVisitor extends SqlShuttle
     {
         SqlKind kind = call.getOperator().getKind();
         
+        if (kind == SqlKind.SELECT) {
+            return handleSelect((SqlSelect) call);
+        }
+        
         // Handle AND/OR operators - may contain standalone boolean columns
         if (kind == SqlKind.AND || kind == SqlKind.OR) {
             return handleLogicalOperator(call);
@@ -121,12 +126,22 @@ public class SubstraitAccumulatorVisitor extends SqlShuttle
             return handleIsNull(call);
         }
         
-        return super.visit(call);
+        SqlNode result = super.visit(call);
+        return result;
     }
 
     @Override
     public SqlNode visit(SqlIdentifier id)
     {
+        if (inWhereClause && id.isSimple() && isBooleanColumn(id.getSimple())) {
+            // Transform bool_col to bool_col = TRUE
+            SqlLiteral trueLiteral = SqlLiteral.createBoolean(true, id.getParserPosition());
+            addToAccumulator(id.getSimple(), trueLiteral);
+            SqlDynamicParam param =
+                    new SqlDynamicParam(accumulator.size() - 1, trueLiteral.getParserPosition());
+            return org.apache.calcite.sql.fun.SqlStdOperatorTable.EQUALS
+                    .createCall(id.getParserPosition(), id, param);
+        }
         if (id.isSimple()) {
             columnStack.push(id.getSimple());
         }
@@ -357,6 +372,30 @@ public class SubstraitAccumulatorVisitor extends SqlShuttle
     {
         // IS NULL doesn't have a literal to parameterize, just traverse
         return super.visit(call);
+    }
+    
+    private SqlNode handleSelect(SqlSelect select)
+    {
+        // Visit WHERE clause with inWhereClause flag set
+        SqlNode where = select.getWhere();
+        SqlNode newWhere = null;
+        if (where != null) {
+            boolean prev = inWhereClause;
+            inWhereClause = true;
+            newWhere = where.accept(this);
+            inWhereClause = prev;
+        }
+
+        // Temporarily null out WHERE so super.visit() doesn't re-traverse it
+        select.setWhere(null);
+
+        // Let the default SqlShuttle traversal handle all other clauses
+        // (SELECT list, FROM, GROUP BY, HAVING, WINDOW, ORDER BY, OFFSET, FETCH, etc.)
+        SqlSelect result = (SqlSelect) super.visit(select);
+
+        // Restore the (transformed) WHERE clause
+        result.setWhere(newWhere);
+        return result;
     }
 
     private void addToAccumulator(String columnName, SqlLiteral literal)

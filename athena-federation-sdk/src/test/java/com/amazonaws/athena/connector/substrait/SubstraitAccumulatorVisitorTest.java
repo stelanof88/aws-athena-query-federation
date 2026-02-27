@@ -374,6 +374,158 @@ public class SubstraitAccumulatorVisitorTest
         assertEquals(SqlKind.EQUALS, ((SqlCall) transformedWhere).getOperator().getKind());
     }
 
+    @Test
+    public void testStandaloneBooleanColumn()
+    {
+        // Test: WHERE bool_col -> WHERE bool_col = TRUE
+        // Create a standalone boolean identifier as WHERE clause
+        SqlIdentifier boolId = new SqlIdentifier("bool_col", SqlParserPos.ZERO);
+        
+        // Wrap it in a SELECT with WHERE clause to enable inWhereClause context
+        SqlNodeList selectList = new SqlNodeList(Arrays.asList(new SqlIdentifier("*", SqlParserPos.ZERO)), SqlParserPos.ZERO);
+        SqlIdentifier from = new SqlIdentifier("test_table", SqlParserPos.ZERO);
+        
+        SqlSelect select = new SqlSelect(
+                SqlParserPos.ZERO,
+                SqlNodeList.EMPTY, // keywords
+                selectList, // selectList
+                from, // from
+                boolId, // where - standalone boolean column
+                null, // groupBy
+                null, // having
+                SqlNodeList.EMPTY, // windowDecls
+                null, // orderBy
+                null, // offset
+                null, // fetch
+                null); // hints
+        
+        SqlNode result = visitor.visit(select);
+        SqlNode transformedWhere = ((SqlSelect) result).getWhere();
+        
+        // Verify: bool_col -> bool_col = TRUE
+        assertEquals(1, accumulator.size());
+        assertEquals(SqlTypeName.BOOLEAN, accumulator.get(0).getType());
+        assertEquals(true, accumulator.get(0).getValue());
+        assertEquals("bool_col", accumulator.get(0).getColumnName());
+        assertEquals(SqlKind.EQUALS, ((SqlCall) transformedWhere).getOperator().getKind());
+        
+        // Verify the EQUALS call has the identifier and dynamic param
+        SqlCall equalsCall = (SqlCall) transformedWhere;
+        assertTrue(equalsCall.operand(0) instanceof SqlIdentifier);
+        assertTrue(equalsCall.operand(1) instanceof SqlDynamicParam);
+        assertEquals("bool_col", ((SqlIdentifier) equalsCall.operand(0)).getSimple());
+    }
+
+    @Test
+    public void testBooleanColumnInAndOperator()
+    {
+        // Test: WHERE bool_col AND int_col = 1 -> WHERE bool_col = TRUE AND int_col = ?
+        SqlIdentifier boolId = new SqlIdentifier("bool_col", SqlParserPos.ZERO);
+        SqlCall intComparison = SqlStdOperatorTable.EQUALS.createCall(SqlParserPos.ZERO,
+                new SqlIdentifier("int_col", SqlParserPos.ZERO),
+                SqlLiteral.createExactNumeric("1", SqlParserPos.ZERO));
+        
+        SqlCall andCall = SqlStdOperatorTable.AND.createCall(SqlParserPos.ZERO, boolId, intComparison);
+        
+        // Wrap in SELECT
+        SqlNodeList selectList = new SqlNodeList(Arrays.asList(new SqlIdentifier("*", SqlParserPos.ZERO)), SqlParserPos.ZERO);
+        SqlIdentifier from = new SqlIdentifier("test_table", SqlParserPos.ZERO);
+        
+        SqlSelect select = new SqlSelect(
+                SqlParserPos.ZERO,
+                SqlNodeList.EMPTY,
+                selectList,
+                from,
+                andCall, // WHERE bool_col AND int_col = 1
+                null, null, SqlNodeList.EMPTY, null, null, null, null);
+        
+        SqlNode result = visitor.visit(select);
+        SqlNode transformedWhere = ((SqlSelect) result).getWhere();
+        
+        // Should have 2 parameters: TRUE for bool_col, and 1 for int_col
+        assertEquals(2, accumulator.size());
+        assertEquals(SqlTypeName.BOOLEAN, accumulator.get(0).getType());
+        assertEquals(true, accumulator.get(0).getValue());
+        assertEquals("bool_col", accumulator.get(0).getColumnName());
+        assertEquals(SqlTypeName.INTEGER, accumulator.get(1).getType());
+        
+        // Verify the AND call structure
+        assertEquals(SqlKind.AND, ((SqlCall) transformedWhere).getOperator().getKind());
+        SqlCall andResult = (SqlCall) transformedWhere;
+        assertTrue(andResult.operand(0) instanceof SqlCall); // bool_col = TRUE
+        assertTrue(andResult.operand(1) instanceof SqlCall); // int_col = ?
+        
+        SqlCall boolEquals = (SqlCall) andResult.operand(0);
+        assertEquals(SqlKind.EQUALS, boolEquals.getOperator().getKind());
+    }
+
+    @Test
+    public void testBooleanColumnInOrOperator()
+    {
+        // Test: WHERE bool_col OR int_col = 1 -> WHERE bool_col = TRUE OR int_col = ?
+        SqlIdentifier boolId = new SqlIdentifier("bool_col", SqlParserPos.ZERO);
+        SqlCall intComparison = SqlStdOperatorTable.EQUALS.createCall(SqlParserPos.ZERO,
+                new SqlIdentifier("int_col", SqlParserPos.ZERO),
+                SqlLiteral.createExactNumeric("1", SqlParserPos.ZERO));
+        
+        SqlCall orCall = SqlStdOperatorTable.OR.createCall(SqlParserPos.ZERO, boolId, intComparison);
+        
+        // Wrap in SELECT
+        SqlNodeList selectList = new SqlNodeList(Arrays.asList(new SqlIdentifier("*", SqlParserPos.ZERO)), SqlParserPos.ZERO);
+        SqlIdentifier from = new SqlIdentifier("test_table", SqlParserPos.ZERO);
+        
+        SqlSelect select = new SqlSelect(
+                SqlParserPos.ZERO,
+                SqlNodeList.EMPTY,
+                selectList,
+                from,
+                orCall, // WHERE bool_col OR int_col = 1
+                null, null, SqlNodeList.EMPTY, null, null, null, null);
+        
+        SqlNode result = visitor.visit(select);
+        SqlNode transformedWhere = ((SqlSelect) result).getWhere();
+        
+        // Should have 2 parameters: TRUE for bool_col, and 1 for int_col
+        assertEquals(2, accumulator.size());
+        assertEquals(SqlTypeName.BOOLEAN, accumulator.get(0).getType());
+        assertEquals(true, accumulator.get(0).getValue());
+        
+        // Verify the OR call structure
+        assertEquals(SqlKind.OR, ((SqlCall) transformedWhere).getOperator().getKind());
+    }
+
+    @Test
+    public void testExplicitBooleanComparison()
+    {
+        // Test: WHERE bool_col = true -> WHERE bool_col = ? (should NOT double-transform)
+        SqlCall equalsCall = SqlStdOperatorTable.EQUALS.createCall(SqlParserPos.ZERO,
+                new SqlIdentifier("bool_col", SqlParserPos.ZERO),
+                SqlLiteral.createBoolean(true, SqlParserPos.ZERO));
+        
+        // Wrap in SELECT
+        SqlNodeList selectList = new SqlNodeList(Arrays.asList(new SqlIdentifier("*", SqlParserPos.ZERO)), SqlParserPos.ZERO);
+        SqlIdentifier from = new SqlIdentifier("test_table", SqlParserPos.ZERO);
+        
+        SqlSelect select = new SqlSelect(
+                SqlParserPos.ZERO,
+                SqlNodeList.EMPTY,
+                selectList,
+                from,
+                equalsCall, // WHERE bool_col = true
+                null, null, SqlNodeList.EMPTY, null, null, null, null);
+        
+        SqlNode result = visitor.visit(select);
+        SqlNode transformedWhere = ((SqlSelect) result).getWhere();
+        
+        // Should have only 1 parameter (the true literal from the explicit comparison)
+        assertEquals(1, accumulator.size());
+        assertEquals(SqlTypeName.BOOLEAN, accumulator.get(0).getType());
+        assertEquals(true, accumulator.get(0).getValue());
+        
+        // Should still be an EQUALS call
+        assertEquals(SqlKind.EQUALS, ((SqlCall) transformedWhere).getOperator().getKind());
+    }
+
     static Stream<Arguments> notFallthroughCases()
     {
         return Stream.of(
