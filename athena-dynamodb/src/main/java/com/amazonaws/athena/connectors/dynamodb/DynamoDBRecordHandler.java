@@ -22,16 +22,29 @@ package com.amazonaws.athena.connectors.dynamodb;
 import com.amazonaws.athena.connector.lambda.QueryStatusChecker;
 import com.amazonaws.athena.connector.lambda.ThrottlingInvoker;
 import com.amazonaws.athena.connector.lambda.data.Block;
+import com.amazonaws.athena.connector.lambda.data.BlockAllocator;
 import com.amazonaws.athena.connector.lambda.data.BlockSpiller;
+import com.amazonaws.athena.connector.lambda.data.BlockUtils;
+import com.amazonaws.athena.connector.lambda.data.S3BlockSpiller;
+import com.amazonaws.athena.connector.lambda.data.SpillConfig;
 import com.amazonaws.athena.connector.lambda.data.writers.GeneratedRowWriter;
 import com.amazonaws.athena.connector.lambda.data.writers.extractors.Extractor;
 import com.amazonaws.athena.connector.lambda.domain.Split;
+import com.amazonaws.athena.connector.lambda.domain.predicate.ConstraintEvaluator;
 import com.amazonaws.athena.connector.lambda.domain.predicate.Constraints;
 import com.amazonaws.athena.connector.lambda.domain.predicate.QueryPlan;
+import com.amazonaws.athena.connector.lambda.domain.spill.S3SpillLocation;
+import com.amazonaws.athena.connector.lambda.domain.spill.SpillLocation;
 import com.amazonaws.athena.connector.lambda.exceptions.AthenaConnectorException;
 import com.amazonaws.athena.connector.lambda.handlers.RecordHandler;
 import com.amazonaws.athena.connector.lambda.records.ReadRecordsRequest;
+import com.amazonaws.athena.connector.lambda.records.RecordResponse;
+import com.amazonaws.athena.connector.lambda.records.RemoteReadRecordsResponse;
+import com.amazonaws.athena.connector.lambda.security.AesGcmBlockCrypto;
+import com.amazonaws.athena.connector.lambda.security.BlockCrypto;
+import com.amazonaws.athena.connector.lambda.security.EncryptionKey;
 import com.amazonaws.athena.connector.lambda.security.FederatedIdentity;
+import com.amazonaws.athena.connector.lambda.security.NoOpBlockCrypto;
 import com.amazonaws.athena.connector.substrait.SubstraitRelUtils;
 import com.amazonaws.athena.connector.substrait.model.SubstraitRelModel;
 import com.amazonaws.athena.connectors.dynamodb.credentials.CrossAccountCredentialsProviderV2;
@@ -48,12 +61,15 @@ import com.google.common.cache.CacheLoader;
 import com.google.common.cache.LoadingCache;
 import io.substrait.proto.FetchRel;
 import io.substrait.proto.Plan;
+import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.tuple.Pair;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import software.amazon.awssdk.awscore.AwsRequestOverrideConfiguration;
+import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.enhanced.dynamodb.document.EnhancedDocument;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.athena.AthenaClient;
@@ -70,6 +86,7 @@ import software.amazon.awssdk.services.dynamodb.model.ScanResponse;
 import software.amazon.awssdk.services.glue.model.ErrorDetails;
 import software.amazon.awssdk.services.glue.model.FederationSourceErrorCode;
 import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 import software.amazon.awssdk.services.secretsmanager.SecretsManagerClient;
 
 import java.io.IOException;
@@ -121,8 +138,21 @@ public class DynamoDBRecordHandler
 
     private final LoadingCache<String, ThrottlingInvoker> invokerCache;
     private final DynamoDbClient ddbClient;
+    // Default S3 client retained from the test constructor. The base RecordHandler keeps its own copy private, so we
+    // hold a reference here as the fallback for getS3Client(...) on the export-schema spill-write path.
+    private final S3Client amazonS3Client;
 
     private final DDBQueryPassthrough queryPassthrough = new DDBQueryPassthrough();
+
+    // Query-passthrough marker argument sent by the Glue StartAsyncQuery direct-query path (QUERY + ExportSchema).
+    // When present, the PartiQL results are written to S3 and the result schema is exported to a sidecar object.
+    public static final String EXPORT_SCHEMA = "ExportSchema";
+    // Suffix for the sidecar object that carries the Arrow schema of the export spill objects.
+    static final String SCHEMA_SUFFIX = ".schema";
+    // Name of the single column in the export schema; each row holds one whole DynamoDB item as JSON.
+    public static final String ITEM_COLUMN_NAME = "item";
+    // DynamoDB items are schemaless, so the export schema is fixed: one VARCHAR column with the item as JSON.
+    static final Schema EXPORT_ITEM_SCHEMA = new Schema(List.of(Field.nullable(ITEM_COLUMN_NAME, ArrowType.Utf8.INSTANCE)));
 
     public DynamoDBRecordHandler(java.util.Map<String, String> configOptions)
     {
@@ -135,6 +165,7 @@ public class DynamoDBRecordHandler
             builder.endpointOverride(URI.create("https://dynamodb." + region + ".amazonaws.eu"));
         }
         this.ddbClient = builder.build();
+        this.amazonS3Client = null;
         this.invokerCache = CacheBuilder.newBuilder().build(
             new CacheLoader<String, ThrottlingInvoker>() {
                 @Override
@@ -152,6 +183,7 @@ public class DynamoDBRecordHandler
     {
         super(amazonS3, secretsManager, athena, sourceType, configOptions);
         this.ddbClient = ddbClient;
+        this.amazonS3Client = amazonS3;
         this.invokerCache = CacheBuilder.newBuilder().build(
             new CacheLoader<String, ThrottlingInvoker>() {
                 @Override
@@ -162,6 +194,136 @@ public class DynamoDBRecordHandler
                 }
             }
         );
+    }
+
+    /**
+     * Intercepts the Glue StartAsyncQuery direct-query path, identified by the {@code ExportSchema} marker in the
+     * query passthrough arguments. That path sends only {@code QUERY} and {@code ExportSchema} (no Athena
+     * {@code schemaFunctionName} signature) along with an empty request schema, so it cannot go through
+     * {@link #readWithConstraint}. Instead the PartiQL statement is executed (following every NextToken page), each
+     * item is written as a JSON row into SDK spill objects ({@code <spillKey>.N}), and the fixed result schema is
+     * written to a {@code <spillKey>.schema} sidecar. All other reads delegate to the base implementation.
+     */
+    @Override
+    public RecordResponse doReadRecords(BlockAllocator allocator, ReadRecordsRequest request)
+            throws Exception
+    {
+        Map<String, String> queryPassthroughArguments = request.getConstraints().getQueryPassthroughArguments();
+        if (queryPassthroughArguments == null || !queryPassthroughArguments.containsKey(EXPORT_SCHEMA)) {
+            return super.doReadRecords(allocator, request);
+        }
+
+        String partiQLStatement = queryPassthroughArguments.get(DDBQueryPassthrough.QUERY);
+        if (StringUtils.isBlank(partiQLStatement)) {
+            throw new AthenaConnectorException("Missing Query Passthrough Value for Argument: " + DDBQueryPassthrough.QUERY,
+                    ErrorDetails.builder().errorCode(FederationSourceErrorCode.INVALID_INPUT_EXCEPTION.toString()).build());
+        }
+        // Only the SELECT-only check applies here; the Athena function-signature check does not (see javadoc).
+        queryPassthrough.customConnectorVerifications(queryPassthroughArguments);
+
+        List<SpillLocation> spillLocations = new ArrayList<>();
+        exportPartiQLResultToSpill(request, partiQLStatement, allocator, spillLocations);
+        return new RemoteReadRecordsResponse(request.getCatalogName(), EXPORT_ITEM_SCHEMA, spillLocations,
+                request.getSplit().getEncryptionKey());
+    }
+
+    /**
+     * Runs the PartiQL statement and writes every returned item, across all result pages, as one JSON row in the
+     * {@link #EXPORT_ITEM_SCHEMA} schema. The schema sidecar is written before any data object so a reader can
+     * discover the schema as soon as the first data object appears. Written data-object locations are appended to
+     * {@code spillLocations}; the sidecar is intentionally not added (it is not a data block).
+     */
+    @VisibleForTesting
+    void exportPartiQLResultToSpill(ReadRecordsRequest request, String partiQLStatement, BlockAllocator allocator,
+            List<SpillLocation> spillLocations)
+            throws Exception
+    {
+        S3SpillLocation spillLocation = (S3SpillLocation) request.getSplit().getSpillLocation();
+        AwsRequestOverrideConfiguration overrideConfig = getRequestOverrideConfig(request.getIdentity().getConfigOptions());
+        S3Client s3Client = resolveScopedS3Client(overrideConfig);
+        SpillConfig spillConfig = buildExportSpillConfig(request);
+
+        logger.info("exportPartiQLResultToSpill: writing records to s3://{}/{}.N and schema to {}{}",
+                spillLocation.getBucket(), spillLocation.getKey(), spillLocation.getKey(), SCHEMA_SUFFIX);
+
+        writeSchemaSidecar(s3Client, spillLocation, request.getSplit().getEncryptionKey(), allocator);
+
+        try (ConstraintEvaluator evaluator = new ConstraintEvaluator(allocator, EXPORT_ITEM_SCHEMA, request.getConstraints());
+                S3BlockSpiller spiller = new S3BlockSpiller(s3Client, spillConfig, allocator, EXPORT_ITEM_SCHEMA, evaluator, configOptions)) {
+            long numRows = 0;
+            int numPages = 0;
+            String nextToken = null;
+            do {
+                ExecuteStatementResponse response = ddbClient.executeStatement(ExecuteStatementRequest.builder()
+                        .statement(partiQLStatement)
+                        .nextToken(nextToken)
+                        .overrideConfiguration(overrideConfig)
+                        .build());
+                numPages++;
+                for (Map<String, AttributeValue> item : response.items()) {
+                    String itemJson = EnhancedDocument.fromAttributeValueMap(item).toJson();
+                    spiller.writeRows((Block block, int rowNum) -> {
+                        BlockUtils.setValue(block.getFieldVector(ITEM_COLUMN_NAME), rowNum, itemJson);
+                        return 1;
+                    });
+                    numRows++;
+                }
+                nextToken = response.nextToken();
+            }
+            while (nextToken != null);
+
+            if (spiller.spilled()) {
+                spillLocations.addAll(spiller.getSpillLocations());
+            }
+            logger.info("exportPartiQLResultToSpill: wrote {} item(s) from {} page(s) across {} spill object(s) + 1 schema sidecar under s3://{}/{}",
+                    numRows, numPages, spillLocations.size(), spillLocation.getBucket(), spillLocation.getKey());
+        }
+    }
+
+    /**
+     * Builds the SpillConfig for the export: forces every batch out to S3 ({@code maxInlineBlockBytes=0}) so the
+     * result is always spill objects (never inline) and uses synchronous spilling.
+     */
+    private SpillConfig buildExportSpillConfig(ReadRecordsRequest request)
+    {
+        return SpillConfig.newBuilder()
+                .withSpillLocation(request.getSplit().getSpillLocation())
+                .withMaxBlockBytes(getSpillConfig(request).getMaxBlockBytes())
+                .withMaxInlineBlockBytes(0)
+                .withRequestId(request.getQueryId())
+                .withEncryptionKey(request.getSplit().getEncryptionKey())
+                .withNumSpillThreads(0)
+                .build();
+    }
+
+    /**
+     * Returns the S3 client for the export writes, using the same credential path as the base spiller: the request
+     * config options carry FAS session credentials for the (cross-account) spill bucket.
+     */
+    private S3Client resolveScopedS3Client(AwsRequestOverrideConfiguration overrideConfig)
+    {
+        S3Client s3Client = getS3Client(overrideConfig, amazonS3Client);
+        return (s3Client != null) ? s3Client : S3Client.create();
+    }
+
+    /**
+     * Writes the export schema to the {@code <spillKey>.schema} sidecar, encrypted with the same SDK crypto as the
+     * data objects (AesGcmBlockCrypto when a key is present, NoOp otherwise).
+     */
+    private void writeSchemaSidecar(S3Client s3Client, S3SpillLocation spillLocation, EncryptionKey encryptionKey,
+            BlockAllocator allocator)
+    {
+        BlockCrypto blockCrypto = (encryptionKey != null)
+                ? new AesGcmBlockCrypto(allocator) : new NoOpBlockCrypto(allocator);
+        byte[] payload = blockCrypto.encrypt(encryptionKey, EXPORT_ITEM_SCHEMA.serializeAsMessage());
+        String key = spillLocation.getKey() + SCHEMA_SUFFIX;
+        s3Client.putObject(PutObjectRequest.builder()
+                        .bucket(spillLocation.getBucket())
+                        .key(key)
+                        .contentLength((long) payload.length)
+                        .build(),
+                RequestBody.fromBytes(payload));
+        logger.info("writeSchemaSidecar: wrote {} bytes to s3://{}/{}", payload.length, spillLocation.getBucket(), key);
     }
 
     /**
