@@ -147,6 +147,11 @@ public class DynamoDBRecordHandler
     // Query-passthrough marker argument sent by the Glue StartAsyncQuery direct-query path (QUERY + ExportSchema).
     // When present, the PartiQL results are written to S3 and the result schema is exported to a sidecar object.
     public static final String EXPORT_SCHEMA = "ExportSchema";
+    // Optional query passthrough argument on the export path capping the total number of exported items. PartiQL for
+    // DynamoDB has no LIMIT clause, so the caller sends it alongside the statement. Must be a positive integer.
+    public static final String LIMIT = "Limit";
+    // Sentinel meaning "no limit" for the export path.
+    static final long NO_LIMIT = -1L;
     // Suffix for the sidecar object that carries the Arrow schema of the export spill objects.
     static final String SCHEMA_SUFFIX = ".schema";
     // Name of the single column in the export schema; each row holds one whole DynamoDB item as JSON.
@@ -220,11 +225,38 @@ public class DynamoDBRecordHandler
         }
         // Only the SELECT-only check applies here; the Athena function-signature check does not (see javadoc).
         queryPassthrough.customConnectorVerifications(queryPassthroughArguments);
+        long limit = parseExportLimit(queryPassthroughArguments.get(LIMIT));
 
         List<SpillLocation> spillLocations = new ArrayList<>();
-        exportPartiQLResultToSpill(request, partiQLStatement, allocator, spillLocations);
+        exportPartiQLResultToSpill(request, partiQLStatement, limit, allocator, spillLocations);
         return new RemoteReadRecordsResponse(request.getCatalogName(), EXPORT_ITEM_SCHEMA, spillLocations,
                 request.getSplit().getEncryptionKey());
+    }
+
+    /**
+     * Parses the optional {@link #LIMIT} argument of the export path.
+     *
+     * @return the limit, or {@link #NO_LIMIT} when the argument is absent or blank
+     * @throws AthenaConnectorException with INVALID_INPUT_EXCEPTION when the value is not a positive integer
+     */
+    @VisibleForTesting
+    static long parseExportLimit(String rawLimit)
+    {
+        if (StringUtils.isBlank(rawLimit)) {
+            return NO_LIMIT;
+        }
+        long limit;
+        try {
+            limit = Long.parseLong(rawLimit.trim());
+        }
+        catch (NumberFormatException e) {
+            limit = 0;
+        }
+        if (limit <= 0) {
+            throw new AthenaConnectorException("Query Passthrough argument " + LIMIT + " must be a positive integer but was: " + rawLimit,
+                    ErrorDetails.builder().errorCode(FederationSourceErrorCode.INVALID_INPUT_EXCEPTION.toString()).build());
+        }
+        return limit;
     }
 
     /**
@@ -232,10 +264,15 @@ public class DynamoDBRecordHandler
      * {@link #EXPORT_ITEM_SCHEMA} schema. The schema sidecar is written before any data object so a reader can
      * discover the schema as soon as the first data object appears. Written data-object locations are appended to
      * {@code spillLocations}; the sidecar is intentionally not added (it is not a data block).
+     *
+     * <p>When {@code limit} is positive, at most {@code limit} items are exported. The remaining count is sent as the
+     * ExecuteStatement {@code Limit} on every page. DynamoDB applies that limit to items <em>evaluated</em>, so a
+     * filtered page can return fewer items while still carrying a NextToken; paging continues until the limit is met
+     * or the result is exhausted.
      */
     @VisibleForTesting
-    void exportPartiQLResultToSpill(ReadRecordsRequest request, String partiQLStatement, BlockAllocator allocator,
-            List<SpillLocation> spillLocations)
+    void exportPartiQLResultToSpill(ReadRecordsRequest request, String partiQLStatement, long limit,
+            BlockAllocator allocator, List<SpillLocation> spillLocations)
             throws Exception
     {
         S3SpillLocation spillLocation = (S3SpillLocation) request.getSplit().getSpillLocation();
@@ -243,8 +280,10 @@ public class DynamoDBRecordHandler
         S3Client s3Client = resolveScopedS3Client(overrideConfig);
         SpillConfig spillConfig = buildExportSpillConfig(request);
 
-        logger.info("exportPartiQLResultToSpill: writing records to s3://{}/{}.N and schema to {}{}",
-                spillLocation.getBucket(), spillLocation.getKey(), spillLocation.getKey(), SCHEMA_SUFFIX);
+        boolean limited = limit > 0;
+        logger.info("exportPartiQLResultToSpill: writing records to s3://{}/{}.N and schema to {}{} (limit: {})",
+                spillLocation.getBucket(), spillLocation.getKey(), spillLocation.getKey(), SCHEMA_SUFFIX,
+                limited ? limit : "none");
 
         writeSchemaSidecar(s3Client, spillLocation, request.getSplit().getEncryptionKey(), allocator);
 
@@ -254,13 +293,19 @@ public class DynamoDBRecordHandler
             int numPages = 0;
             String nextToken = null;
             do {
-                ExecuteStatementResponse response = ddbClient.executeStatement(ExecuteStatementRequest.builder()
+                ExecuteStatementRequest.Builder statementRequest = ExecuteStatementRequest.builder()
                         .statement(partiQLStatement)
                         .nextToken(nextToken)
-                        .overrideConfiguration(overrideConfig)
-                        .build());
+                        .overrideConfiguration(overrideConfig);
+                if (limited) {
+                    statementRequest.limit((int) Math.min(limit - numRows, Integer.MAX_VALUE));
+                }
+                ExecuteStatementResponse response = ddbClient.executeStatement(statementRequest.build());
                 numPages++;
                 for (Map<String, AttributeValue> item : response.items()) {
+                    if (limited && numRows >= limit) {
+                        break;
+                    }
                     String itemJson = EnhancedDocument.fromAttributeValueMap(item).toJson();
                     spiller.writeRows((Block block, int rowNum) -> {
                         BlockUtils.setValue(block.getFieldVector(ITEM_COLUMN_NAME), rowNum, itemJson);
@@ -270,7 +315,7 @@ public class DynamoDBRecordHandler
                 }
                 nextToken = response.nextToken();
             }
-            while (nextToken != null);
+            while (nextToken != null && (!limited || numRows < limit));
 
             if (spiller.spilled()) {
                 spillLocations.addAll(spiller.getSpillLocations());

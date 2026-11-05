@@ -27,6 +27,7 @@ import com.amazonaws.athena.connector.lambda.domain.TableName;
 import com.amazonaws.athena.connector.lambda.domain.predicate.Constraints;
 import com.amazonaws.athena.connector.lambda.domain.predicate.QueryPlan;
 import com.amazonaws.athena.connector.lambda.domain.spill.S3SpillLocation;
+import com.amazonaws.athena.connector.lambda.domain.spill.SpillLocation;
 import com.amazonaws.athena.connector.lambda.exceptions.AthenaConnectorException;
 import com.amazonaws.athena.connector.lambda.records.ReadRecordsRequest;
 import com.amazonaws.athena.connector.lambda.records.RecordResponse;
@@ -51,6 +52,7 @@ import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
 import software.amazon.awssdk.services.dynamodb.model.ExecuteStatementRequest;
 import software.amazon.awssdk.services.dynamodb.model.ExecuteStatementResponse;
+import software.amazon.awssdk.services.glue.model.FederationSourceErrorCode;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 import software.amazon.awssdk.services.secretsmanager.SecretsManagerClient;
@@ -67,6 +69,8 @@ import java.util.Map;
 import static com.amazonaws.athena.connectors.dynamodb.DynamoDBRecordHandler.EXPORT_ITEM_SCHEMA;
 import static com.amazonaws.athena.connectors.dynamodb.DynamoDBRecordHandler.EXPORT_SCHEMA;
 import static com.amazonaws.athena.connectors.dynamodb.DynamoDBRecordHandler.ITEM_COLUMN_NAME;
+import static com.amazonaws.athena.connectors.dynamodb.DynamoDBRecordHandler.LIMIT;
+import static com.amazonaws.athena.connectors.dynamodb.DynamoDBRecordHandler.NO_LIMIT;
 import static com.amazonaws.athena.connectors.dynamodb.DynamoDBRecordHandler.SCHEMA_SUFFIX;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
@@ -234,14 +238,151 @@ public class DynamoDBRecordHandlerExportSchemaTest
         verifyNoInteractions(s3Client);
     }
 
+    @Test
+    public void doReadRecords_withExportSchemaAndLimit_capsRowsAndSendsLimitToDynamoDB()
+            throws Exception
+    {
+        when(ddbClient.executeStatement(any(ExecuteStatementRequest.class))).thenReturn(
+                ExecuteStatementResponse.builder().items(item("a"), item("b")).nextToken("page-2").build());
+
+        RemoteReadRecordsResponse response = (RemoteReadRecordsResponse) handler.doReadRecords(allocator,
+                exportRequest(encryptionKey, QUERY, "2"));
+
+        // Limit reached on the first page: NextToken is not followed.
+        ArgumentCaptor<ExecuteStatementRequest> ddbCaptor = ArgumentCaptor.forClass(ExecuteStatementRequest.class);
+        verify(ddbClient, times(1)).executeStatement(ddbCaptor.capture());
+        assertEquals(Integer.valueOf(2), ddbCaptor.getValue().limit());
+        assertEquals(List.of("a", "b"), readPks(response));
+    }
+
+    @Test
+    public void doReadRecords_withExportSchemaAndLimit_sendsRemainingCountOnLaterPages()
+            throws Exception
+    {
+        // A filtered PartiQL page can return fewer items than the Limit (which bounds items evaluated) and still
+        // carry a NextToken, so paging must continue with the remaining count.
+        when(ddbClient.executeStatement(any(ExecuteStatementRequest.class))).thenReturn(
+                ExecuteStatementResponse.builder().items(item("a")).nextToken("page-2").build(),
+                ExecuteStatementResponse.builder().items(Collections.emptyList()).nextToken("page-3").build(),
+                ExecuteStatementResponse.builder().items(item("b"), item("c")).nextToken("page-4").build());
+
+        RemoteReadRecordsResponse response = (RemoteReadRecordsResponse) handler.doReadRecords(allocator,
+                exportRequest(encryptionKey, QUERY, " 3 "));
+
+        ArgumentCaptor<ExecuteStatementRequest> ddbCaptor = ArgumentCaptor.forClass(ExecuteStatementRequest.class);
+        verify(ddbClient, times(3)).executeStatement(ddbCaptor.capture());
+        assertEquals(Integer.valueOf(3), ddbCaptor.getAllValues().get(0).limit());
+        assertEquals(Integer.valueOf(2), ddbCaptor.getAllValues().get(1).limit());
+        assertEquals("page-2", ddbCaptor.getAllValues().get(1).nextToken());
+        assertEquals(Integer.valueOf(2), ddbCaptor.getAllValues().get(2).limit());
+        assertEquals("page-3", ddbCaptor.getAllValues().get(2).nextToken());
+        assertEquals(List.of("a", "b", "c"), readPks(response));
+    }
+
+    @Test
+    public void doReadRecords_withExportSchemaAndLimit_neverWritesMoreThanLimitEvenIfPageIsLarger()
+            throws Exception
+    {
+        when(ddbClient.executeStatement(any(ExecuteStatementRequest.class))).thenReturn(
+                ExecuteStatementResponse.builder().items(item("a"), item("b"), item("c")).build());
+
+        RemoteReadRecordsResponse response = (RemoteReadRecordsResponse) handler.doReadRecords(allocator,
+                exportRequest(encryptionKey, QUERY, "2"));
+
+        assertEquals(List.of("a", "b"), readPks(response));
+    }
+
+    @Test
+    public void doReadRecords_withExportSchemaAndLimitLargerThanResult_exportsEverything()
+            throws Exception
+    {
+        when(ddbClient.executeStatement(any(ExecuteStatementRequest.class))).thenReturn(
+                ExecuteStatementResponse.builder().items(item("a")).nextToken("page-2").build(),
+                ExecuteStatementResponse.builder().items(item("b")).build());
+
+        RemoteReadRecordsResponse response = (RemoteReadRecordsResponse) handler.doReadRecords(allocator,
+                exportRequest(encryptionKey, QUERY, "100"));
+
+        verify(ddbClient, times(2)).executeStatement(any(ExecuteStatementRequest.class));
+        assertEquals(List.of("a", "b"), readPks(response));
+    }
+
+    @Test
+    public void doReadRecords_withExportSchemaAndNoLimit_doesNotSendLimitToDynamoDB()
+            throws Exception
+    {
+        when(ddbClient.executeStatement(any(ExecuteStatementRequest.class)))
+                .thenReturn(ExecuteStatementResponse.builder().items(item("a")).build());
+
+        handler.doReadRecords(allocator, exportRequest(encryptionKey, QUERY));
+
+        ArgumentCaptor<ExecuteStatementRequest> ddbCaptor = ArgumentCaptor.forClass(ExecuteStatementRequest.class);
+        verify(ddbClient).executeStatement(ddbCaptor.capture());
+        assertNull(ddbCaptor.getValue().limit());
+    }
+
+    @Test
+    public void doReadRecords_withExportSchemaAndInvalidLimit_throwsWithoutCallingDynamoDB()
+    {
+        for (String invalid : List.of("0", "-1", "abc", "1.5", "9223372036854775808")) {
+            AthenaConnectorException e = assertThrows(AthenaConnectorException.class,
+                    () -> handler.doReadRecords(allocator, exportRequest(encryptionKey, QUERY, invalid)));
+            assertEquals(FederationSourceErrorCode.INVALID_INPUT_EXCEPTION.toString(), e.getErrorDetails().errorCode());
+        }
+        verifyNoInteractions(ddbClient);
+        verifyNoInteractions(s3Client);
+    }
+
+    @Test
+    public void parseExportLimit_handlesAbsentBlankAndValidValues()
+    {
+        assertEquals(NO_LIMIT, DynamoDBRecordHandler.parseExportLimit(null));
+        assertEquals(NO_LIMIT, DynamoDBRecordHandler.parseExportLimit("  "));
+        assertEquals(1L, DynamoDBRecordHandler.parseExportLimit("1"));
+        assertEquals(5_000_000_000L, DynamoDBRecordHandler.parseExportLimit("5000000000"));
+    }
+
+    private static Map<String, AttributeValue> item(String pk)
+    {
+        return Map.of("pk", AttributeValue.builder().s(pk).build());
+    }
+
+    /**
+     * Decrypts every advertised spill object and returns the {@code pk} of each exported item, in order.
+     */
+    private List<String> readPks(RemoteReadRecordsResponse response)
+            throws Exception
+    {
+        Map<String, byte[]> written = capturePutObjects();
+        AesGcmBlockCrypto crypto = new AesGcmBlockCrypto(allocator);
+        List<String> pks = new ArrayList<>();
+        for (SpillLocation location : response.getRemoteBlocks()) {
+            try (Block block = crypto.decrypt(encryptionKey, written.get(((S3SpillLocation) location).getKey()), EXPORT_ITEM_SCHEMA)) {
+                for (int i = 0; i < block.getRowCount(); i++) {
+                    block.getFieldReader(ITEM_COLUMN_NAME).setPosition(i);
+                    pks.add(objectMapper.readTree(block.getFieldReader(ITEM_COLUMN_NAME).readText().toString()).get("pk").asText());
+                }
+            }
+        }
+        return pks;
+    }
+
     /**
      * Builds the request the way GlueDNAConnectorService StartAsyncQueryHandler does in pass-through mode.
      */
     private ReadRecordsRequest exportRequest(EncryptionKey key, String query)
     {
+        return exportRequest(key, query, null);
+    }
+
+    private ReadRecordsRequest exportRequest(EncryptionKey key, String query, String limit)
+    {
         Map<String, String> qptArguments = new HashMap<>();
         qptArguments.put(DDBQueryPassthrough.QUERY, query);
         qptArguments.put(EXPORT_SCHEMA, "true");
+        if (limit != null) {
+            qptArguments.put(LIMIT, limit);
+        }
         Constraints constraints = new Constraints(Map.of(), List.of(), List.of(), -1L, qptArguments,
                 new QueryPlan("", ""));
         Split split = new Split(new S3SpillLocation(BUCKET, SPILL_KEY, true), key, Collections.emptyMap());
