@@ -103,6 +103,18 @@
                 <type>pom</type>
                 <scope>import</scope>
             </dependency>
+            <!-- Align every transitive AWS SDK v2 module to ${aws-sdk-v2.version}. Without this, aws-encryption-sdk-java ->
+                 aws-cryptographic-material-providers drags in dynamodb and netty-nio-client 2.26.3, which get baked
+                 (unrelocated) into the federation SDK withdep/shaded jar and then shadow the connector's own
+                 dynamodb client when the connector is shaded. That old client has no aws-eusc partition, so it
+                 resolves eusc-* regions to amazonaws.com instead of amazonaws.eu. -->
+            <dependency>
+                <groupId>software.amazon.awssdk</groupId>
+                <artifactId>bom</artifactId>
+                <version>${aws-sdk-v2.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
             <!-- Fix for CVE-2025-27820: Override httpclient5 version from AWS SDK transitive dependencies -->
             <dependency>
                 <groupId>org.apache.httpcomponents.client5</groupId>
