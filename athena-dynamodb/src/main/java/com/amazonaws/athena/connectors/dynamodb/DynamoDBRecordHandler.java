@@ -48,8 +48,11 @@ import com.amazonaws.athena.connector.lambda.security.NoOpBlockCrypto;
 import com.amazonaws.athena.connector.substrait.SubstraitRelUtils;
 import com.amazonaws.athena.connector.substrait.model.SubstraitRelModel;
 import com.amazonaws.athena.connectors.dynamodb.credentials.CrossAccountCredentialsProviderV2;
+import com.amazonaws.athena.connectors.dynamodb.model.DynamoDBTable;
 import com.amazonaws.athena.connectors.dynamodb.qpt.DDBQueryPassthrough;
 import com.amazonaws.athena.connectors.dynamodb.resolver.DynamoDBFieldResolver;
+import com.amazonaws.athena.connectors.dynamodb.resolver.DynamoDBTableResolver;
+import com.amazonaws.athena.connectors.dynamodb.util.DDBPlanSplitPlanner;
 import com.amazonaws.athena.connectors.dynamodb.util.DDBPredicateUtils;
 import com.amazonaws.athena.connectors.dynamodb.util.DDBRecordMetadata;
 import com.amazonaws.athena.connectors.dynamodb.util.DDBTypeUtils;
@@ -158,6 +161,14 @@ public class DynamoDBRecordHandler
     public static final String ITEM_COLUMN_NAME = "item";
     // DynamoDB items are schemaless, so the export schema is fixed: one VARCHAR column with the item as JSON.
     static final Schema EXPORT_ITEM_SCHEMA = new Schema(List.of(Field.nullable(ITEM_COLUMN_NAME, ArrowType.Utf8.INSTANCE)));
+    // Config option capping the rows a single plan export may write. The plan export runs as one read (no parallel
+    // segments), so an unbounded scan of a large table would run until the Lambda times out; failing with a clear
+    // error past this cap tells the caller to add a key predicate or LIMIT instead.
+    public static final String PLAN_EXPORT_MAX_ROWS = "plan_export_max_rows";
+    static final long DEFAULT_PLAN_EXPORT_MAX_ROWS = 1_000_000L;
+
+    // Resolves table metadata (keys, indexes) for the plan export, which has no GetTableLayout/GetSplits step.
+    private final DynamoDBTableResolver tableResolver;
 
     public DynamoDBRecordHandler(java.util.Map<String, String> configOptions)
     {
@@ -171,6 +182,8 @@ public class DynamoDBRecordHandler
         }
         this.ddbClient = builder.build();
         this.amazonS3Client = null;
+        this.tableResolver = new DynamoDBTableResolver(
+                ThrottlingInvoker.newDefaultBuilder(EXCEPTION_FILTER, configOptions).build(), this.ddbClient);
         this.invokerCache = CacheBuilder.newBuilder().build(
             new CacheLoader<String, ThrottlingInvoker>() {
                 @Override
@@ -189,6 +202,8 @@ public class DynamoDBRecordHandler
         super(amazonS3, secretsManager, athena, sourceType, configOptions);
         this.ddbClient = ddbClient;
         this.amazonS3Client = amazonS3;
+        this.tableResolver = new DynamoDBTableResolver(
+                ThrottlingInvoker.newDefaultBuilder(EXCEPTION_FILTER, configOptions).build(), ddbClient);
         this.invokerCache = CacheBuilder.newBuilder().build(
             new CacheLoader<String, ThrottlingInvoker>() {
                 @Override
@@ -202,12 +217,18 @@ public class DynamoDBRecordHandler
     }
 
     /**
-     * Intercepts the Glue StartAsyncQuery direct-query path, identified by the {@code ExportSchema} marker in the
-     * query passthrough arguments. That path sends only {@code QUERY} and {@code ExportSchema} (no Athena
-     * {@code schemaFunctionName} signature) along with an empty request schema, so it cannot go through
-     * {@link #readWithConstraint}. Instead the PartiQL statement is executed (following every NextToken page), each
-     * item is written as a JSON row into SDK spill objects ({@code <spillKey>.N}), and the fixed result schema is
-     * written to a {@code <spillKey>.schema} sidecar. All other reads delegate to the base implementation.
+     * Intercepts the Glue StartAsyncQuery export paths, identified by the {@code ExportSchema} marker in the query
+     * passthrough arguments. Both write each DynamoDB item as a JSON row into SDK spill objects
+     * ({@code <spillKey>.N}) and the fixed result schema to a {@code <spillKey>.schema} sidecar:
+     * <ul>
+     *     <li><b>PartiQL export</b> ({@code QUERY} + {@code ExportSchema}): the statement is executed following every
+     *     NextToken page. That path sends no Athena {@code schemaFunctionName} signature and an empty request
+     *     schema, so it cannot go through {@link #readWithConstraint}.</li>
+     *     <li><b>Plan export</b> ({@code ExportSchema} + a Substrait {@code QueryPlan}, no {@code QUERY}): the plan
+     *     runs as a single read with no GetTableLayout/GetSplits step and no request Schema, see
+     *     {@link #exportPlanResultToSpill}.</li>
+     * </ul>
+     * All other reads delegate to the base implementation.
      */
     @Override
     public RecordResponse doReadRecords(BlockAllocator allocator, ReadRecordsRequest request)
@@ -216,6 +237,14 @@ public class DynamoDBRecordHandler
         Map<String, String> queryPassthroughArguments = request.getConstraints().getQueryPassthroughArguments();
         if (queryPassthroughArguments == null || !queryPassthroughArguments.containsKey(EXPORT_SCHEMA)) {
             return super.doReadRecords(allocator, request);
+        }
+
+        if (!queryPassthroughArguments.containsKey(DDBQueryPassthrough.QUERY) && hasSubstraitPlan(request.getConstraints())) {
+            long limit = parseExportLimit(queryPassthroughArguments.get(LIMIT));
+            List<SpillLocation> spillLocations = new ArrayList<>();
+            exportPlanResultToSpill(request, limit, allocator, spillLocations);
+            return new RemoteReadRecordsResponse(request.getCatalogName(), EXPORT_ITEM_SCHEMA, spillLocations,
+                    request.getSplit().getEncryptionKey());
         }
 
         String partiQLStatement = queryPassthroughArguments.get(DDBQueryPassthrough.QUERY);
@@ -322,6 +351,123 @@ public class DynamoDBRecordHandler
             }
             logger.info("exportPartiQLResultToSpill: wrote {} item(s) from {} page(s) across {} spill object(s) + 1 schema sidecar under s3://{}/{}",
                     numRows, numPages, spillLocations.size(), spillLocation.getBucket(), spillLocation.getKey());
+        }
+    }
+
+    /**
+     * Runs a Substrait plan as a single read and writes every matching item, whole, as one JSON row in the
+     * {@link #EXPORT_ITEM_SCHEMA} schema (same output as the PartiQL export: {@code <spillKey>.schema} sidecar
+     * first, then {@code <spillKey>.N} data objects).
+     *
+     * <p>There is no GetTableLayout/GetSplits step and no request Schema: the table comes from the request
+     * TableName, and {@link DDBPlanSplitPlanner} derives the DynamoDB requests from the plan (one Query per hash
+     * key value when the plan has a hash key equality/IN predicate, otherwise one unsegmented Scan), restricted to
+     * indexes that return every attribute. Requests run sequentially without a ProjectionExpression, so DynamoDB
+     * returns full items. Range key and non-key predicates are pushed down exactly as on the split path.
+     *
+     * <p>The effective row cap is the smaller of the plan's FetchRel limit and the {@link #LIMIT} argument, applied
+     * across all requests (this is one read, so it is a true global limit). Exceeding
+     * {@link #PLAN_EXPORT_MAX_ROWS} fails the read rather than letting an unbounded scan run until timeout.
+     */
+    @VisibleForTesting
+    void exportPlanResultToSpill(ReadRecordsRequest request, long requestedLimit, BlockAllocator allocator,
+            List<SpillLocation> spillLocations)
+            throws Exception
+    {
+        S3SpillLocation spillLocation = (S3SpillLocation) request.getSplit().getSpillLocation();
+        AwsRequestOverrideConfiguration overrideConfig = getRequestOverrideConfig(request.getIdentity().getConfigOptions());
+        Constraints constraints = request.getConstraints();
+        Plan plan = SubstraitRelUtils.deserializeSubstraitPlan(constraints.getQueryPlan().getSubstraitPlan());
+
+        String requestedTable = request.getTableName() == null ? null : request.getTableName().getTableName();
+        if (StringUtils.isBlank(requestedTable)) {
+            throw new AthenaConnectorException("TableName is required to run a query plan export",
+                    ErrorDetails.builder().errorCode(FederationSourceErrorCode.INVALID_INPUT_EXCEPTION.toString()).build());
+        }
+        DynamoDBTable table;
+        try {
+            table = tableResolver.getTableMetadata(requestedTable, overrideConfig);
+        }
+        catch (TimeoutException e) {
+            throw new AthenaConnectorException(e.getMessage(), ErrorDetails.builder().errorCode(FederationSourceErrorCode.OPERATION_TIMEOUT_EXCEPTION.toString()).build());
+        }
+        List<Map<String, String>> requests = DDBPlanSplitPlanner.planSplits(table, plan);
+
+        Pair<Boolean, Integer> planLimit = getLimit(plan, constraints);
+        long limit = requestedLimit;
+        if (planLimit.getLeft() && planLimit.getRight() > 0 && (limit <= 0 || planLimit.getRight() < limit)) {
+            limit = planLimit.getRight();
+        }
+        boolean limited = limit > 0;
+        long maxRows = getPlanExportMaxRows();
+
+        S3Client s3Client = resolveScopedS3Client(overrideConfig);
+        SpillConfig spillConfig = buildExportSpillConfig(request);
+        logger.info("exportPlanResultToSpill: table {} as {} {} request(s), writing records to s3://{}/{}.N (limit: {}, max rows: {})",
+                table.getName(), requests.size(), requests.get(0).containsKey(SEGMENT_ID_PROPERTY) ? "Scan" : "Query",
+                spillLocation.getBucket(), spillLocation.getKey(), limited ? limit : "none", maxRows);
+
+        writeSchemaSidecar(s3Client, spillLocation, request.getSplit().getEncryptionKey(), allocator);
+
+        try (ConstraintEvaluator evaluator = new ConstraintEvaluator(allocator, EXPORT_ITEM_SCHEMA, constraints);
+                S3BlockSpiller spiller = new S3BlockSpiller(s3Client, spillConfig, allocator, EXPORT_ITEM_SCHEMA, evaluator, configOptions)) {
+            long numRows = 0;
+            requestLoop:
+            for (Map<String, String> properties : requests) {
+                Split split = new Split(spillLocation, request.getSplit().getEncryptionKey(), properties);
+                // disableProjectionAndCasing=true: no ProjectionExpression, so DynamoDB returns whole items.
+                Iterator<Map<String, AttributeValue>> items = getIterator(split, table.getName(), EXPORT_ITEM_SCHEMA,
+                        constraints, true, plan, overrideConfig);
+                while (items.hasNext()) {
+                    // Check before next(): next() may issue another DynamoDB page request.
+                    if (limited && numRows >= limit) {
+                        break requestLoop;
+                    }
+                    Map<String, AttributeValue> item = items.next();
+                    if (item == null) {
+                        continue;
+                    }
+                    if (numRows >= maxRows) {
+                        throw new AthenaConnectorException("Query plan result exceeds " + maxRows + " rows. Add a key "
+                                + "predicate or a LIMIT to the plan, or raise " + PLAN_EXPORT_MAX_ROWS + ".",
+                                ErrorDetails.builder().errorCode(FederationSourceErrorCode.INVALID_INPUT_EXCEPTION.toString()).build());
+                    }
+                    String itemJson = EnhancedDocument.fromAttributeValueMap(item).toJson();
+                    spiller.writeRows((Block block, int rowNum) -> {
+                        BlockUtils.setValue(block.getFieldVector(ITEM_COLUMN_NAME), rowNum, itemJson);
+                        return 1;
+                    });
+                    numRows++;
+                }
+            }
+
+            if (spiller.spilled()) {
+                spillLocations.addAll(spiller.getSpillLocations());
+            }
+            logger.info("exportPlanResultToSpill: wrote {} item(s) across {} spill object(s) + 1 schema sidecar under s3://{}/{}",
+                    numRows, spillLocations.size(), spillLocation.getBucket(), spillLocation.getKey());
+        }
+    }
+
+    private static boolean hasSubstraitPlan(Constraints constraints)
+    {
+        QueryPlan queryPlan = constraints.getQueryPlan();
+        return queryPlan != null && StringUtils.isNotBlank(queryPlan.getSubstraitPlan());
+    }
+
+    private long getPlanExportMaxRows()
+    {
+        String configured = configOptions.get(PLAN_EXPORT_MAX_ROWS);
+        if (StringUtils.isBlank(configured)) {
+            return DEFAULT_PLAN_EXPORT_MAX_ROWS;
+        }
+        try {
+            long value = Long.parseLong(configured.trim());
+            return value > 0 ? value : DEFAULT_PLAN_EXPORT_MAX_ROWS;
+        }
+        catch (NumberFormatException e) {
+            logger.warn("Ignoring invalid {} value: {}", PLAN_EXPORT_MAX_ROWS, configured);
+            return DEFAULT_PLAN_EXPORT_MAX_ROWS;
         }
     }
 

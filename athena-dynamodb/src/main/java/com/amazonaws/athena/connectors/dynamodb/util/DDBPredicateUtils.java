@@ -93,6 +93,25 @@ public class DDBPredicateUtils
     }
 
     /**
+     * Same as {@link #getBestIndexForPredicatesForPlan} but for reads that must return every attribute of each item
+     * (whole-item export). Only the base table and indexes that can return all attributes are candidates: a GSI
+     * with a KEYS_ONLY or INCLUDE projection only returns the attributes copied into it, so querying one would
+     * silently drop the rest of the item. LSIs are already modelled as {@link ProjectionType#ALL} because DynamoDB
+     * fetches unprojected attributes from the base table for them.
+     */
+    public static DynamoDBIndex getBestIndexForPlanReturningAllAttributes(DynamoDBTable table,
+                                                                          Map<String, List<ColumnPredicate>> filterPredicates)
+    {
+        if (filterPredicates == null || filterPredicates.isEmpty()) {
+            return createTableIndex(table);
+        }
+        return findBestIndexInternal(table,
+                index -> index.getProjectionType() == ProjectionType.ALL,
+                filterPredicates::containsKey,
+                columnName -> !getHashKeyAttributeValues(filterPredicates.get(columnName)).isEmpty());
+    }
+
+    /**
      * Generates a list of distinct values from the given {@link ValueSet} or an empty list if not possible.
      *
      * @param valueSet the value set to generate from
@@ -208,6 +227,18 @@ public class DDBPredicateUtils
                                                       Predicate<String> hasPredicateForColumn,
                                                       Predicate<String> hasValidHashKeyValues)
     {
+        // requested columns must be projected in index
+        return findBestIndexInternal(table,
+                index -> indexContainsAllRequiredColumns(requestedCols, index, table),
+                hasPredicateForColumn,
+                hasValidHashKeyValues);
+    }
+
+    private static DynamoDBIndex findBestIndexInternal(DynamoDBTable table,
+                                                      Predicate<DynamoDBIndex> isCandidateIndex,
+                                                      Predicate<String> hasPredicateForColumn,
+                                                      Predicate<String> hasValidHashKeyValues)
+    {
         DynamoDBIndex tableIndex = createTableIndex(table);
 
         ImmutableList.Builder<DynamoDBIndex> hashKeyMatchesBuilder = ImmutableList.builder();
@@ -217,9 +248,8 @@ public class DDBPredicateUtils
             hashKeyMatchesBuilder.add(tableIndex);
         }
 
-        // requested columns must be projected in index
         List<DynamoDBIndex> candidateIndices = table.getIndexes().stream()
-                .filter(index -> indexContainsAllRequiredColumns(requestedCols, index, table))
+                .filter(isCandidateIndex)
                 .collect(Collectors.toList());
 
         // get indices with hash keys that match a predicate
