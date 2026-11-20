@@ -62,6 +62,7 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.cache.CacheBuilder;
 import com.google.common.cache.CacheLoader;
 import com.google.common.cache.LoadingCache;
+import io.substrait.proto.Expression;
 import io.substrait.proto.FetchRel;
 import io.substrait.proto.Plan;
 import org.apache.arrow.vector.types.pojo.ArrowType;
@@ -105,8 +106,10 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
+import static com.amazonaws.athena.connectors.dynamodb.constants.DynamoDBConstants.BINARY_EXPRESSION_VALUE_NAMES_METADATA;
 import static com.amazonaws.athena.connectors.dynamodb.constants.DynamoDBConstants.EXPRESSION_NAMES_METADATA;
 import static com.amazonaws.athena.connectors.dynamodb.constants.DynamoDBConstants.EXPRESSION_VALUES_METADATA;
+import static com.amazonaws.athena.connectors.dynamodb.constants.DynamoDBConstants.HASH_KEY_BINARY_METADATA;
 import static com.amazonaws.athena.connectors.dynamodb.constants.DynamoDBConstants.HASH_KEY_NAME_METADATA;
 import static com.amazonaws.athena.connectors.dynamodb.constants.DynamoDBConstants.INDEX_METADATA;
 import static com.amazonaws.athena.connectors.dynamodb.constants.DynamoDBConstants.NON_KEY_FILTER_METADATA;
@@ -395,10 +398,12 @@ public class DynamoDBRecordHandler
 
         Pair<Boolean, Integer> planLimit = getLimit(plan, constraints);
         long limit = requestedLimit;
-        if (planLimit.getLeft() && planLimit.getRight() > 0 && (limit <= 0 || planLimit.getRight() < limit)) {
-            limit = planLimit.getRight();
-        }
         boolean limited = limit > 0;
+        // An explicit plan LIMIT 0 is honoured (no rows, no DynamoDB call) rather than ignored.
+        if (planLimit.getLeft() && planLimit.getRight() >= 0 && (!limited || planLimit.getRight() < limit)) {
+            limit = planLimit.getRight();
+            limited = true;
+        }
         long maxRows = getPlanExportMaxRows();
 
         S3Client s3Client = resolveScopedS3Client(overrideConfig);
@@ -667,9 +672,7 @@ public class DynamoDBRecordHandler
     {
         if (useQueryPlan) {
             if (substraitRelModel.getSortRel() == null && substraitRelModel.getFetchRel() != null) {
-                FetchRel fetchRel = substraitRelModel.getFetchRel();
-                int limit = (int) fetchRel.getCount();
-                return Optional.of(limit);
+                return fetchRelLimit(substraitRelModel.getFetchRel());
             }
             return Optional.empty();
         }
@@ -677,6 +680,67 @@ public class DynamoDBRecordHandler
             return Optional.of((int) constraints.getLimit());
         }
         return Optional.empty();
+    }
+
+    /**
+     * Reads the row count of a plan's FetchRel, or empty when it cannot be pushed down. Substrait encodes the count
+     * either as the {@code count} field or as a {@code count_expr} expression; only an integer literal expression is
+     * understood. A count that is absent, negative (Substrait "all rows") or not a literal is not pushed down, and a
+     * non-zero offset disables pushdown because DynamoDB has no offset and the cap would apply to the wrong rows.
+     * A literal count of 0 is returned as 0 (callers must not send it to DynamoDB, whose Limit minimum is 1).
+     */
+    @VisibleForTesting
+    static Optional<Integer> fetchRelLimit(FetchRel fetchRel)
+    {
+        Optional<Long> offset;
+        switch (fetchRel.getOffsetModeCase()) {
+            case OFFSET:
+                offset = Optional.of(fetchRel.getOffset());
+                break;
+            case OFFSET_EXPR:
+                offset = integerLiteral(fetchRel.getOffsetExpr());
+                break;
+            default:
+                offset = Optional.of(0L);
+        }
+        if (offset.isEmpty() || offset.get() != 0) {
+            return Optional.empty();
+        }
+        Optional<Long> count;
+        switch (fetchRel.getCountModeCase()) {
+            case COUNT:
+                count = Optional.of(fetchRel.getCount());
+                break;
+            case COUNT_EXPR:
+                count = integerLiteral(fetchRel.getCountExpr());
+                break;
+            default:
+                count = Optional.empty();
+        }
+        if (count.isEmpty() || count.get() < 0) {
+            return Optional.empty();
+        }
+        return Optional.of((int) Math.min(count.get(), Integer.MAX_VALUE));
+    }
+
+    private static Optional<Long> integerLiteral(Expression expression)
+    {
+        if (expression == null || !expression.hasLiteral()) {
+            return Optional.empty();
+        }
+        Expression.Literal literal = expression.getLiteral();
+        switch (literal.getLiteralTypeCase()) {
+            case I8:
+                return Optional.of((long) literal.getI8());
+            case I16:
+                return Optional.of((long) literal.getI16());
+            case I32:
+                return Optional.of((long) literal.getI32());
+            case I64:
+                return Optional.of(literal.getI64());
+            default:
+                return Optional.empty();
+        }
     }
 
     private boolean rangeFilterHasIn(String rangeKeyFilter) 
@@ -727,6 +791,7 @@ public class DynamoDBRecordHandler
                 ObjectMapper objectMapper = new ObjectMapper();
                 expressionAttributeNames.putAll(objectMapper.readValue(split.getProperty(EXPRESSION_NAMES_METADATA), STRING_MAP_TYPE_REFERENCE));
                 expressionAttributeValues.putAll(EnhancedDocument.fromJson(split.getProperty(EXPRESSION_VALUES_METADATA)).toMap());
+                DDBTypeUtils.restoreBinaryValues(expressionAttributeValues, split.getProperty(BINARY_EXPRESSION_VALUE_NAMES_METADATA));
             }
             catch (IOException e) {
                 throw new AthenaConnectorException(e.getMessage(), ErrorDetails.builder().errorCode(FederationSourceErrorCode.INTERNAL_SERVICE_EXCEPTION.toString()).build());
@@ -762,6 +827,9 @@ public class DynamoDBRecordHandler
         expressionAttributeNames.put(hashKeyAlias, hashKeyName);
 
         AttributeValue hashKeyAttribute = DDBTypeUtils.jsonToAttributeValue(split.getProperty(hashKeyName), hashKeyName);
+        if ("true".equals(split.getProperty(HASH_KEY_BINARY_METADATA))) {
+            hashKeyAttribute = DDBTypeUtils.restoreBinary(hashKeyAttribute);
+        }
         expressionAttributeValues.put(HASH_KEY_VALUE_ALIAS, hashKeyAttribute);
 
         QueryRequest.Builder queryRequestBuilder = QueryRequest.builder()
@@ -776,7 +844,10 @@ public class DynamoDBRecordHandler
                 .exclusiveStartKey(exclusiveStartKey);
 
         boolean limitPresent = limitPair.getLeft();
-        if (limitPresent) {
+        // DynamoDB rejects Limit < 1; an explicit LIMIT 0 is enforced by the caller instead. Limit counts items
+        // evaluated, not returned, so under a FilterExpression it would only shrink every page; the caller stops at
+        // the row limit instead.
+        if (limitPresent && limitPair.getRight() > 0 && nonKeyFilter == null) {
             queryRequestBuilder.limit(limitPair.getRight());
         }
         return queryRequestBuilder.build();
@@ -802,6 +873,7 @@ public class DynamoDBRecordHandler
                 ObjectMapper objectMapper = new ObjectMapper();
                 expressionAttributeNames.putAll(objectMapper.readValue(split.getProperty(EXPRESSION_NAMES_METADATA), STRING_MAP_TYPE_REFERENCE));
                 expressionAttributeValues.putAll(EnhancedDocument.fromJson(split.getProperty(EXPRESSION_VALUES_METADATA)).toMap());
+                DDBTypeUtils.restoreBinaryValues(expressionAttributeValues, split.getProperty(BINARY_EXPRESSION_VALUE_NAMES_METADATA));
             }
             catch (IOException e) {
                 throw new AthenaConnectorException(e.getMessage(), ErrorDetails.builder().errorCode(FederationSourceErrorCode.INTERNAL_SERVICE_EXCEPTION.toString()).build());
@@ -832,7 +904,10 @@ public class DynamoDBRecordHandler
                 .overrideConfiguration(overrideConfiguration)
                 .exclusiveStartKey(exclusiveStartKey);
         boolean limitPresent = limitPair.getLeft();
-        if (limitPresent) {
+        // DynamoDB rejects Limit < 1; an explicit LIMIT 0 is enforced by the caller instead. Limit counts items
+        // evaluated, not returned, so under a FilterExpression it would only shrink every page; the caller stops at
+        // the row limit instead.
+        if (limitPresent && limitPair.getRight() > 0 && nonKeyFilter == null) {
             scanRequestBuilder.limit(limitPair.getRight());
         }
         return scanRequestBuilder.build();

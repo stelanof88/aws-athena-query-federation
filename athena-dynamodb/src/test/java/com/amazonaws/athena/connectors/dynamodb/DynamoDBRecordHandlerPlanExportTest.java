@@ -98,6 +98,7 @@ import static com.amazonaws.athena.connectors.dynamodb.DynamoDBRecordHandler.ITE
 import static com.amazonaws.athena.connectors.dynamodb.DynamoDBRecordHandler.LIMIT;
 import static com.amazonaws.athena.connectors.dynamodb.DynamoDBRecordHandler.PLAN_EXPORT_MAX_ROWS;
 import static com.amazonaws.athena.connectors.dynamodb.DynamoDBRecordHandler.SCHEMA_SUFFIX;
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertThrows;
@@ -368,6 +369,80 @@ public class DynamoDBRecordHandlerPlanExportTest
         verify(ddbClient, never()).scan(any(ScanRequest.class));
     }
 
+    @Test
+    public void limitWithFilter_doesNotSendPerPageLimit()
+            throws Exception
+    {
+        // DynamoDB Limit counts items evaluated, not returned, so under a filter it only shrinks every page.
+        when(ddbClient.scan(any(ScanRequest.class))).thenReturn(ScanResponse.builder()
+                .items(item("a", 1, "shipped"), item("a", 2, "shipped"), item("a", 3, "shipped"), item("a", 4, "shipped")).build());
+
+        RemoteReadRecordsResponse response = run("SELECT * FROM orders WHERE status = 'shipped' LIMIT 3", Map.of());
+
+        ScanRequest scan = captureScans(1).get(0);
+        assertNull(scan.limit());
+        assertEquals("the row limit is still enforced globally", 3, readItems(response).size());
+    }
+
+    @Test
+    public void limitWithoutFilter_sendsLimitToDynamoDb()
+            throws Exception
+    {
+        when(ddbClient.scan(any(ScanRequest.class))).thenReturn(ScanResponse.builder().items(item("a", 1, "x")).build());
+
+        run("SELECT * FROM orders LIMIT 3", Map.of());
+
+        assertEquals(Integer.valueOf(3), captureScans(1).get(0).limit());
+    }
+
+    @Test
+    public void binaryNonKeyLiteral_isSentAsB()
+            throws Exception
+    {
+        when(ddbClient.scan(any(ScanRequest.class))).thenReturn(ScanResponse.builder().items(item("a", 1, "x")).build());
+
+        run("SELECT * FROM orders WHERE bin_attr = X'0102'", Map.of());
+
+        AttributeValue sent = captureScans(1).get(0).expressionAttributeValues().values().iterator().next();
+        assertNull("binary must not become a string", sent.s());
+        assertArrayEquals(new byte[] {1, 2}, sent.b().asByteArray());
+    }
+
+    @Test
+    public void binaryHashKeyLiteral_isSentAsB()
+            throws Exception
+    {
+        when(ddbClient.describeTable(any(DescribeTableRequest.class))).thenReturn(DescribeTableResponse.builder()
+                .table(TableDescription.builder()
+                        .tableName(TABLE)
+                        .keySchema(KeySchemaElement.builder().attributeName("bpk").keyType(KeyType.HASH).build())
+                        .attributeDefinitions(AttributeDefinition.builder().attributeName("bpk")
+                                .attributeType(ScalarAttributeType.B).build())
+                        .tableSizeBytes(1_000L)
+                        .itemCount(10L)
+                        .build()).build());
+        when(ddbClient.query(any(QueryRequest.class))).thenReturn(QueryResponse.builder().items(item("a", 1, "x")).build());
+
+        run("SELECT * FROM orders WHERE bpk = X'0102'", Map.of());
+
+        AttributeValue sent = captureQueries(1).get(0).expressionAttributeValues().get(":hashKeyValue");
+        assertNull("binary must not become a string", sent.s());
+        assertArrayEquals(new byte[] {1, 2}, sent.b().asByteArray());
+    }
+
+    @Test
+    public void stringLiteralWithBase64Text_staysS()
+            throws Exception
+    {
+        when(ddbClient.query(any(QueryRequest.class))).thenReturn(QueryResponse.builder().items(item("AQI=", 1, "x")).build());
+
+        run("SELECT * FROM orders WHERE pk = 'AQI='", Map.of());
+
+        AttributeValue sent = captureQueries(1).get(0).expressionAttributeValues().get(":hashKeyValue");
+        assertEquals("AQI=", sent.s());
+        assertNull(sent.b());
+    }
+
     private RemoteReadRecordsResponse run(String sql, Map<String, String> extraOptions)
             throws Exception
     {
@@ -418,7 +493,9 @@ public class DynamoDBRecordHandlerPlanExportTest
                         Pair.of("sk", factory.createSqlType(SqlTypeName.BIGINT)),
                         Pair.of("status", factory.createSqlType(SqlTypeName.VARCHAR)),
                         Pair.of("keys_only_key", factory.createSqlType(SqlTypeName.VARCHAR)),
-                        Pair.of("all_key", factory.createSqlType(SqlTypeName.VARCHAR))));
+                        Pair.of("all_key", factory.createSqlType(SqlTypeName.VARCHAR)),
+                        Pair.of("bin_attr", factory.createSqlType(SqlTypeName.VARBINARY)),
+                        Pair.of("bpk", factory.createSqlType(SqlTypeName.VARBINARY))));
             }
         };
         CalciteSchema root = CalciteSchema.createRootSchema(false);

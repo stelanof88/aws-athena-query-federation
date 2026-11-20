@@ -47,8 +47,10 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
+import static com.amazonaws.athena.connectors.dynamodb.constants.DynamoDBConstants.BINARY_EXPRESSION_VALUE_NAMES_METADATA;
 import static com.amazonaws.athena.connectors.dynamodb.constants.DynamoDBConstants.EXPRESSION_NAMES_METADATA;
 import static com.amazonaws.athena.connectors.dynamodb.constants.DynamoDBConstants.EXPRESSION_VALUES_METADATA;
+import static com.amazonaws.athena.connectors.dynamodb.constants.DynamoDBConstants.HASH_KEY_BINARY_METADATA;
 import static com.amazonaws.athena.connectors.dynamodb.constants.DynamoDBConstants.HASH_KEY_NAME_METADATA;
 import static com.amazonaws.athena.connectors.dynamodb.constants.DynamoDBConstants.INDEX_METADATA;
 import static com.amazonaws.athena.connectors.dynamodb.constants.DynamoDBConstants.NON_KEY_FILTER_METADATA;
@@ -145,14 +147,24 @@ public final class DDBPlanSplitPlanner
         if (isQuery) {
             // One DynamoDB Query per distinct hash key value (a Query takes exactly one). Duplicates in an IN list
             // would otherwise return the same items twice.
+            // A binary value and a string with the same base64 text are different keys, so track them separately.
             Set<String> hashKeyValues = new LinkedHashSet<>();
+            Set<String> binaryHashKeyValues = new LinkedHashSet<>();
             for (ColumnPredicate predicate : hashKeyPredicates) {
                 Object value = DDBTypeUtils.convertArrowTypeIfNecessary(hashKeyName, predicate.getValue());
-                hashKeyValues.add(DDBTypeUtils.attributeToJson(DDBTypeUtils.toAttributeValue(value), hashKeyName));
+                AttributeValue attributeValue = DDBTypeUtils.toAttributeValue(value);
+                String json = DDBTypeUtils.attributeToJson(attributeValue, hashKeyName);
+                (attributeValue.b() != null ? binaryHashKeyValues : hashKeyValues).add(json);
             }
             for (String hashKeyValue : hashKeyValues) {
                 Map<String, String> split = new HashMap<>(metadata);
                 split.put(hashKeyName, hashKeyValue);
+                splits.add(split);
+            }
+            for (String hashKeyValue : binaryHashKeyValues) {
+                Map<String, String> split = new HashMap<>(metadata);
+                split.put(hashKeyName, hashKeyValue);
+                split.put(HASH_KEY_BINARY_METADATA, "true");
                 splits.add(split);
             }
         }
@@ -233,9 +245,17 @@ public final class DDBPlanSplitPlanner
             aliasedColumns.put(DDBPredicateUtils.aliasColumn(column), column);
         }
         Map<String, AttributeValue> expressionValues = new HashMap<>();
+        List<String> binaryValueNames = new ArrayList<>();
         IncrementingValueNameProducer valueNames = new IncrementingValueNameProducer();
         for (AttributeValue value : valueAccumulator) {
-            expressionValues.put(valueNames.getNext(), value);
+            String valueName = valueNames.getNext();
+            expressionValues.put(valueName, value);
+            if (value.b() != null) {
+                binaryValueNames.add(valueName);
+            }
+        }
+        if (!binaryValueNames.isEmpty()) {
+            metadata.put(BINARY_EXPRESSION_VALUE_NAMES_METADATA, String.join(",", binaryValueNames));
         }
         try {
             metadata.put(EXPRESSION_NAMES_METADATA, MAPPER.writeValueAsString(aliasedColumns));

@@ -37,6 +37,12 @@ public final class DynamoDBConstants
     public static final String NON_KEY_FILTER_METADATA = "nonKeyFilter";
     public static final String EXPRESSION_NAMES_METADATA = "expressionAttributeNames";
     public static final String EXPRESSION_VALUES_METADATA = "expressionAttributeValues";
+    // Split properties travel as JSON, which has no binary type: a B value is written as base64 text and read back
+    // as S. These record which values were B so the record handler can restore them. Absent means "no binary values".
+    // Comma-separated names of the expression attribute value placeholders (e.g. ":v0") that hold B values.
+    public static final String BINARY_EXPRESSION_VALUE_NAMES_METADATA = "binaryExpressionValueNames";
+    // "true" when the split's hash key value is B.
+    public static final String HASH_KEY_BINARY_METADATA = "hashKeyBinary";
 
     // Metadata key whose value is a string that represents the maping from normalized column names to
     // any non-8601 format that customer wants to specify

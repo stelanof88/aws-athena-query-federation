@@ -60,6 +60,7 @@ import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
@@ -629,6 +630,34 @@ public final class DDBTypeUtils
     {
         EnhancedDocument enhancedDocument = EnhancedDocument.fromAttributeValueMap(ImmutableMap.of(key, attributeValue));
         return enhancedDocument.toJson();
+    }
+
+    /**
+     * Turns the S that a B value becomes after a trip through EnhancedDocument JSON (base64 text) back into a B.
+     */
+    public static AttributeValue restoreBinary(AttributeValue value)
+    {
+        if (value == null || value.s() == null) {
+            throw new AthenaConnectorException("Expected a base64 string for a binary value",
+                    ErrorDetails.builder().errorCode(FederationSourceErrorCode.INVALID_INPUT_EXCEPTION.toString()).build());
+        }
+        return AttributeValue.builder().b(SdkBytes.fromByteArray(Base64.getDecoder().decode(value.s()))).build();
+    }
+
+    /**
+     * Restores B for the values named in {@code binaryNames} (comma-separated placeholder names). A null or empty list
+     * leaves the values unchanged.
+     */
+    public static void restoreBinaryValues(Map<String, AttributeValue> values, String binaryNames)
+    {
+        if (binaryNames == null || binaryNames.isEmpty()) {
+            return;
+        }
+        for (String name : binaryNames.split(",")) {
+            if (values.containsKey(name)) {
+                values.put(name, restoreBinary(values.get(name)));
+            }
+        }
     }
 
     public static AttributeValue jsonToAttributeValue(String jsonString, String key)
